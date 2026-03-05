@@ -10,9 +10,11 @@ const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 
 app.post("/whatsapp", async (req, res) => {
 
+  let reply = "Sorry, something went wrong.";
+
   try {
 
-    const incoming = req.body.Body;
+    const incoming = req.body.Body || "Hello";
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -22,7 +24,7 @@ app.post("/whatsapp", async (req, res) => {
         "content-type": "application/json"
       },
       body: JSON.stringify({
-        model: "claude-3-haiku-20240307",
+        model: "claude-3-haiku",
         max_tokens: 120,
         messages: [
           {
@@ -37,37 +39,28 @@ app.post("/whatsapp", async (req, res) => {
 
     console.log("Claude response:", data);
 
-    let reply = "Sorry, something went wrong.";
-
     if (data && data.content && data.content.length > 0) {
       reply = data.content[0].text;
     }
 
-    res.set("Content-Type", "text/xml");
+  } catch (error) {
 
-    res.send(`
+    console.error("Claude API Error:", error);
+    reply = "AI service temporarily unavailable.";
+
+  }
+
+  res.set("Content-Type", "text/xml");
+
+  res.send(`
 <Response>
 <Message>${reply}</Message>
 </Response>
 `);
 
-  } catch (error) {
-
-    console.error("Error:", error);
-
-    res.set("Content-Type", "text/xml");
-
-    res.send(`
-<Response>
-<Message>Sorry something went wrong try again later.</Message>
-</Response>
-`);
-
-  }
-
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log("Server running on port", PORT);
