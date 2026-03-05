@@ -1,67 +1,54 @@
-import express from "express";
-import fetch from "node-fetch";
+import express from "express"
+import fetch from "node-fetch"
+import twilio from "twilio"
 
-const app = express();
+const app = express()
+app.use(express.urlencoded({ extended: false }))
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const MessagingResponse = twilio.twiml.MessagingResponse
 
 app.post("/whatsapp", async (req, res) => {
 
-  let reply = "Sorry, something went wrong.";
+  const incomingMsg = req.body.Body
 
   try {
-
-    const incoming = req.body.Body || "Hello";
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "Content-Type": "application/json",
+        "x-api-key": process.env.CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
-        model: "claude-3-haiku",
+        model: "claude-3-haiku-20240307",
         max_tokens: 120,
         messages: [
-          {
-            role: "user",
-            content: incoming
-          }
+          { role: "user", content: incomingMsg }
         ]
       })
-    });
+    })
 
-    const data = await response.json();
+    const data = await response.json()
 
-    console.log("Claude response:", data);
+    const reply = data.content[0].text
 
-    if (data && data.content && data.content.length > 0) {
-      reply = data.content[0].text;
-    }
+    const twiml = new MessagingResponse()
+    twiml.message(reply)
+
+    res.writeHead(200, { "Content-Type": "text/xml" })
+    res.end(twiml.toString())
 
   } catch (error) {
 
-    console.error("Claude API Error:", error);
-    reply = "AI service temporarily unavailable.";
+    const twiml = new MessagingResponse()
+    twiml.message("ATW system error. Please try again shortly.")
+
+    res.writeHead(200, { "Content-Type": "text/xml" })
+    res.end(twiml.toString())
 
   }
 
-  res.set("Content-Type", "text/xml");
+})
 
-  res.send(`
-<Response>
-<Message>${reply}</Message>
-</Response>
-`);
-
-});
-
-const PORT = process.env.PORT || 8080;
-
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+app.listen(process.env.PORT || 3000)
