@@ -1,52 +1,75 @@
-import express from "express";
-import fetch from "node-fetch";
+const express = require("express");
+const axios = require("axios");
+const bodyParser = require("body-parser");
 
 const app = express();
-
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 
+app.get("/", (req, res) => {
+  res.send("ATW WhatsApp Bot running");
+});
+
 app.post("/whatsapp", async (req, res) => {
+  try {
+    const incomingMsg = req.body.Body;
 
-  const incoming = req.body.Body;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": CLAUDE_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 200,
-      messages: [
-        {
-          role: "user",
-          content: incoming
+    const response = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-3-haiku-20240307",
+        max_tokens: 200,
+        messages: [
+          {
+            role: "user",
+            content: incomingMsg
+          }
+        ]
+      },
+      {
+        headers: {
+          "x-api-key": CLAUDE_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
         }
-      ]
-    })
-  });
+      }
+    );
 
-  const data = await response.json();
+    let reply = "Sorry, I couldn't generate a response.";
 
-  const reply = data.content[0].text;
+    if (
+      response.data &&
+      response.data.content &&
+      response.data.content.length > 0 &&
+      response.data.content[0].text
+    ) {
+      reply = response.data.content[0].text;
+    }
 
-  res.set("Content-Type", "text/xml");
-
-  res.send(`
+    const twiml = `
 <Response>
 <Message>${reply}</Message>
-</Response>
-`);
+</Response>`;
 
+    res.set("Content-Type", "text/xml");
+    res.send(twiml);
+
+  } catch (error) {
+    console.error("Error:", error.response?.data || error.message);
+
+    const twiml = `
+<Response>
+<Message>Sorry, something went wrong. Please try again later.</Message>
+</Response>`;
+
+    res.set("Content-Type", "text/xml");
+    res.send(twiml);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log("Server running");
+  console.log("Server running on port", PORT);
 });
