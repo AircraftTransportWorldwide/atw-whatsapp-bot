@@ -1,52 +1,52 @@
-require("dotenv").config();
-
-const express = require("express");
-const cors = require("cors");
-const Stripe = require("stripe");
+import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-
-app.use(cors());
+app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.send("Server running");
-});
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 
-app.post("/create-checkout-session", async (req, res) => {
-  try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      mode: "payment",
+app.post("/whatsapp", async (req, res) => {
 
-      line_items: [
+  const incoming = req.body.Body;
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": CLAUDE_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 200,
+      messages: [
         {
-          price_data: {
-            currency: "usd",
-            product_data: {
-              name: "Digital Product",
-            },
-            unit_amount: 5000,
-          },
-          quantity: 1,
-        },
-      ],
+          role: "user",
+          content: incoming
+        }
+      ]
+    })
+  });
 
-      success_url: process.env.DOMAIN + "/success.html",
-      cancel_url: process.env.DOMAIN + "/cancel.html",
-    });
+  const data = await response.json();
 
-    res.json({ url: session.url });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Stripe session error" });
-  }
+  const reply = data.content[0].text;
+
+  res.set("Content-Type", "text/xml");
+
+  res.send(`
+<Response>
+<Message>${reply}</Message>
+</Response>
+`);
+
 });
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log("Server running");
 });
