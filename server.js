@@ -31,6 +31,10 @@ app.post("/whatsapp", async (req, res) => {
 
     const data = await response.json()
 
+    if (!data.content) {
+      throw new Error(JSON.stringify(data))
+    }
+
     const reply = data.content[0].text
 
     const twiml = new MessagingResponse()
@@ -40,6 +44,8 @@ app.post("/whatsapp", async (req, res) => {
     res.end(twiml.toString())
 
   } catch (error) {
+
+    console.log(error)
 
     const twiml = new MessagingResponse()
     twiml.message("ATW system error. Please try again shortly.")
