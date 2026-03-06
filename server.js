@@ -1,5 +1,5 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v2)
+// ATW WhatsApp Bot — server.js (v3)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // ============================================================
 // What this bot does:
@@ -7,7 +7,17 @@
 //   - Responds as ATW's AI assistant using Claude
 //   - Handles initial AOG inquiries and basic quotes
 //   - Protects against token/cost abuse
+//   - REMEMBERS conversation history per phone number
 //   - Logs everything so you can monitor it
+// ============================================================
+// WHAT'S NEW IN v3:
+//   - Conversation memory: the bot now remembers previous
+//     messages in the same conversation (per phone number)
+//   - Conversations expire after 1 hour of inactivity
+//   - History is capped at the last 10 message pairs (20 msgs)
+//     to keep API costs reasonable
+//   - Memory resets on server restart (this is fine for now —
+//     Chatwoot will add permanent storage later)
 // ============================================================
 
 import express from "express";
@@ -37,13 +47,6 @@ if (!CLAUDE_API_KEY) {
 
 // ============================================================
 // BOT PERSONALITY & RULES
-// ============================================================
-// This is the "system prompt" — it tells Claude who it is,
-// what it should do, and what it must NOT do. Edit this to
-// change how the bot behaves.
-//
-// Tomorrow we will add a knowledge base section here with
-// specific routes, pricing tiers, service details, etc.
 // ============================================================
 
 const SYSTEM_PROMPT = `You are the AI assistant for Aircraft Transport Worldwide (ATW), a freight forwarding company specializing in AOG (Aircraft On Ground) situations.
@@ -77,80 +80,125 @@ TONE:
 - Confident and knowledgeable about logistics
 - Keep messages SHORT — this is WhatsApp, not email. 2-4 sentences per reply unless more detail is needed
 
+CONVERSATION CONTEXT:
+- You are in an ongoing WhatsApp conversation. You can see previous messages in this chat.
+- If the client has already provided details (part number, origin, destination, etc.), do NOT ask for them again.
+- Reference information from earlier in the conversation naturally.
+- If the conversation seems to be about a new/different shipment, you can ask to confirm.
+
 IMPORTANT: If you don't know something specific, say so honestly and let them know a team member will follow up. Never make up pricing, transit times, or capabilities.`;
+
+// ============================================================
+// CONVERSATION MEMORY
+// ============================================================
+// Stores message history per phone number so the bot remembers
+// what was said earlier in the conversation.
+//
+// How it works:
+//   - Each phone number gets an array of messages
+//   - We send the full history to Claude with each request
+//   - History is capped at MAX_HISTORY_PAIRS (10 = 20 messages)
+//   - Conversations expire after CONVERSATION_TIMEOUT_MS (1 hour)
+//   - Memory resets on server restart (in-memory only)
+//
+// Cost impact:
+//   - Instead of sending 1 message per request, we send up to 20
+//   - This roughly 2-5x your token usage per request
+//   - But it makes the bot MUCH more useful for real conversations
+// ============================================================
+
+const MAX_HISTORY_PAIRS = 10;                    // keep last 10 exchanges (20 messages)
+const CONVERSATION_TIMEOUT_MS = 60 * 60 * 1000;  // 1 hour of inactivity = new conversation
+
+// Structure: Map<sender, { messages: [...], lastActivity: timestamp }>
+const conversationHistory = new Map();
+
+function getConversation(sender) {
+  const convo = conversationHistory.get(sender);
+
+  // No history exists for this number
+  if (!convo) {
+    return [];
+  }
+
+  // Check if the conversation has expired (1 hour of silence)
+  const now = Date.now();
+  if (now - convo.lastActivity > CONVERSATION_TIMEOUT_MS) {
+    console.log(`[MEMORY] Conversation expired for ${sender} (inactive ${Math.round((now - convo.lastActivity) / 60000)} min). Starting fresh.`);
+    conversationHistory.delete(sender);
+    return [];
+  }
+
+  return convo.messages;
+}
+
+function addToConversation(sender, userMessage, assistantReply) {
+  const existing = getConversation(sender); // also handles expiry check
+
+  // Add the new exchange
+  existing.push({ role: "user", content: userMessage });
+  existing.push({ role: "assistant", content: assistantReply });
+
+  // Trim to max history (keep the most recent pairs)
+  while (existing.length > MAX_HISTORY_PAIRS * 2) {
+    existing.shift(); // remove oldest message
+    existing.shift(); // remove its pair
+  }
+
+  conversationHistory.set(sender, {
+    messages: existing,
+    lastActivity: Date.now(),
+  });
+
+  console.log(`[MEMORY] Stored ${existing.length / 2} exchanges for ${sender}`);
+}
+
+// ── Cleanup old conversations periodically ─────────────────────
+// Runs every 30 minutes to prevent memory buildup from numbers
+// that chatted once and never came back.
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [sender, convo] of conversationHistory) {
+    if (now - convo.lastActivity > CONVERSATION_TIMEOUT_MS) {
+      conversationHistory.delete(sender);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    console.log(`[MEMORY] Cleanup: removed ${cleaned} expired conversations. Active: ${conversationHistory.size}`);
+  }
+}, 30 * 60 * 1000);
 
 // ============================================================
 // TOKEN ABUSE PROTECTION
 // ============================================================
-// These settings prevent someone from spamming your bot and
-// running up your Anthropic API bill.
-// ============================================================
 
-// -- Setting 1: Rate limiting --
-// Maximum messages a single phone number can send in a time window.
-// If they exceed this, they get a "slow down" message instead of
-// an AI response (which costs zero API tokens).
-const RATE_LIMIT_MAX_MESSAGES = 15;       // max messages allowed...
-const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // ...in this time window (10 minutes)
+const RATE_LIMIT_MAX_MESSAGES = 15;
+const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 
-// This stores message timestamps per phone number.
-// It resets when the server restarts, which is fine — it's just
-// to prevent rapid abuse, not long-term tracking.
 const rateLimitMap = new Map();
 
 function isRateLimited(sender) {
   const now = Date.now();
   const timestamps = rateLimitMap.get(sender) || [];
-
-  // Remove timestamps older than the window
   const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
 
   if (recent.length >= RATE_LIMIT_MAX_MESSAGES) {
-    return true; // This user has sent too many messages
+    return true;
   }
 
-  // Record this new message
   recent.push(now);
   rateLimitMap.set(sender, recent);
   return false;
 }
 
-// -- Setting 2: Message length limit --
-// If someone sends a massive wall of text (trying to use up tokens
-// on the input side), we reject it before it hits the API.
-const MAX_INCOMING_LENGTH = 1000; // characters
-
-// -- Setting 3: Claude response token limit --
-// This caps how long Claude's reply can be (and how much it costs).
-// 400 tokens is roughly 300 words — plenty for WhatsApp messages.
+const MAX_INCOMING_LENGTH = 1000;
 const MAX_REPLY_TOKENS = 400;
-
-// ============================================================
-// OPTIONAL: Restrict to known numbers only
-// ============================================================
-// Uncomment the section below if you want ONLY specific phone
-// numbers to be able to use the bot. Everyone else gets a
-// "not authorized" message.
-//
-// To use this:
-// 1. Uncomment the lines below
-// 2. Add your client numbers in the format shown
-// 3. The number format must match what Twilio sends
-//    (usually "whatsapp:+1234567890")
-//
-// const ALLOWED_NUMBERS = new Set([
-//   "whatsapp:+1234567890",
-//   "whatsapp:+0987654321",
-//   // Add more numbers here
-// ]);
-//
-// function isAllowedNumber(sender) {
-//   return ALLOWED_NUMBERS.has(sender);
-// }
 
 // ── Health check endpoint ──────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send("ATW WhatsApp Bot is running.");
+  res.send("ATW WhatsApp Bot v3 is running. Active conversations: " + conversationHistory.size);
 });
 
 // ── Main WhatsApp webhook ──────────────────────────────────────
@@ -202,32 +250,27 @@ app.post("/whatsapp", async (req, res) => {
     return;
   }
 
-  // ── OPTIONAL: Check allowed numbers ──────────────────────────
-  // Uncomment the block below if you enabled the allowed numbers
-  // list above.
-  //
-  // if (!isAllowedNumber(sender)) {
-  //   console.warn("UNAUTHORIZED number:", sender);
-  //   const twiml = new MessagingResponse();
-  //   twiml.message(
-  //     "This service is available to registered ATW clients only. " +
-  //     "Please contact us at [your email] to get started."
-  //   );
-  //   res.writeHead(200, { "Content-Type": "text/xml" });
-  //   res.end(twiml.toString());
-  //   return;
-  // }
-
   try {
+    // ── Get conversation history for this sender ───────────────
+    const history = getConversation(sender);
+
+    console.log(`[MEMORY] Found ${history.length / 2} previous exchanges for ${sender}`);
+
+    // ── Build messages array with history + new message ────────
+    const messages = [
+      ...history,                                    // previous messages (if any)
+      { role: "user", content: incomingMsg },        // current message
+    ];
+
     // ── Build the API request ──────────────────────────────────
     const requestBody = {
       model: "claude-sonnet-4-20250514",
       max_tokens: MAX_REPLY_TOKENS,
       system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: incomingMsg }],
+      messages: messages,   // <-- now includes full conversation history
     };
 
-    console.log("Sending to Claude API...");
+    console.log("Sending to Claude API with", messages.length, "messages...");
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -271,6 +314,9 @@ app.post("/whatsapp", async (req, res) => {
 
     console.log("Claude replied:", reply.slice(0, 120) + "...");
 
+    // ── Save this exchange to conversation history ─────────────
+    addToConversation(sender, incomingMsg, reply);
+
     // ── Send reply back to WhatsApp ────────────────────────────
     const twiml = new MessagingResponse();
     twiml.message(reply);
@@ -295,11 +341,12 @@ app.post("/whatsapp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v2");
+  console.log("ATW WhatsApp Bot v3 — Now with memory!");
   console.log("Server is running on port " + PORT);
   console.log("Webhook URL: POST /whatsapp");
   console.log("Rate limit: " + RATE_LIMIT_MAX_MESSAGES + " msgs per " + (RATE_LIMIT_WINDOW_MS / 60000) + " min");
   console.log("Max message length: " + MAX_INCOMING_LENGTH + " chars");
   console.log("Max reply tokens: " + MAX_REPLY_TOKENS);
+  console.log("Conversation memory: last " + MAX_HISTORY_PAIRS + " exchanges, " + (CONVERSATION_TIMEOUT_MS / 60000) + " min timeout");
   console.log("============================================");
 });
