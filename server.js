@@ -10,12 +10,8 @@
 //   - REMEMBERS conversation history per phone number
 //   - SENDS EMAIL ALERTS based on inquiry tier
 //   - FORWARDS all conversations to Chatwoot dashboard
+//   - AGENTS can reply through Chatwoot → WhatsApp
 //   - Logs everything so you can monitor it
-// ============================================================
-// WHAT'S NEW IN v5:
-//   - Chatwoot integration: all conversations mirrored to dashboard
-//   - Agents can see every WhatsApp conversation in Chatwoot
-//   - Language enforcement: bot stays in client's language
 // ============================================================
 
 import express from "express";
@@ -34,6 +30,9 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const CHATWOOT_API_URL = process.env.CHATWOOT_API_URL;
 const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
 
 if (!CLAUDE_API_KEY) {
   console.error("============================================");
@@ -55,7 +54,6 @@ if (!RESEND_API_KEY) {
 
 if (!CHATWOOT_API_URL || !CHATWOOT_API_TOKEN || !CHATWOOT_ACCOUNT_ID) {
   console.error("WARNING: Chatwoot config incomplete! Dashboard forwarding disabled.");
-  console.error("Need: CHATWOOT_API_URL, CHATWOOT_API_TOKEN, CHATWOOT_ACCOUNT_ID");
 } else {
   console.log("Chatwoot integration loaded successfully.");
   console.log("Chatwoot URL:", CHATWOOT_API_URL);
@@ -64,6 +62,15 @@ if (!CHATWOOT_API_URL || !CHATWOOT_API_TOKEN || !CHATWOOT_ACCOUNT_ID) {
 
 // ── Initialize Resend ──────────────────────────────────────────
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+// ── Initialize Twilio client (for agent replies) ───────────────
+let twilioClient = null;
+if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+  twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  console.log("Twilio client initialized for agent replies.");
+} else {
+  console.error("WARNING: Twilio credentials not set! Agent replies via Chatwoot disabled.");
+}
 
 // ============================================================
 // EMAIL ALERT SETTINGS
@@ -224,20 +231,9 @@ setInterval(() => {
 // ============================================================
 // CHATWOOT INTEGRATION
 // ============================================================
-// Forwards all WhatsApp conversations to Chatwoot so the team
-// can see them in the dashboard. Also allows agents to take
-// over conversations by replying directly in Chatwoot.
-//
-// How it works:
-//   1. Client sends WhatsApp message → bot responds (as before)
-//   2. Bot creates/finds a conversation in Chatwoot for this number
-//   3. Bot sends the client's message AND bot's reply to Chatwoot
-//   4. Team sees everything in the Chatwoot dashboard
-// ============================================================
 
-// Cache Chatwoot contact IDs and conversation IDs per phone number
-// so we don't create duplicates
 const chatwootCache = new Map();
+const chatwootToPhone = new Map();
 
 async function getOrCreateChatwootContact(phoneNumber) {
   const cached = chatwootCache.get(phoneNumber);
@@ -248,7 +244,6 @@ async function getOrCreateChatwootContact(phoneNumber) {
   const cleanPhone = phoneNumber.replace("whatsapp:", "");
 
   try {
-    // Search for existing contact
     const searchRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${encodeURIComponent(cleanPhone)}`,
       {
@@ -261,7 +256,6 @@ async function getOrCreateChatwootContact(phoneNumber) {
       const contact = searchData.payload[0];
       console.log(`[CHATWOOT] Found existing contact: ${contact.id}`);
 
-      // Find existing conversation for this contact
       const convRes = await fetch(
         `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${contact.id}/conversations`,
         {
@@ -281,7 +275,6 @@ async function getOrCreateChatwootContact(phoneNumber) {
       return cacheEntry;
     }
 
-    // Create new contact
     const createRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
       {
@@ -317,7 +310,6 @@ async function getOrCreateConversation(phoneNumber, contactId) {
   }
 
   try {
-    // Get inbox ID (we need to find the WhatsApp inbox)
     const inboxRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/inboxes`,
       {
@@ -326,7 +318,6 @@ async function getOrCreateConversation(phoneNumber, contactId) {
     );
     const inboxData = await inboxRes.json();
 
-    // Find the WhatsApp/Twilio inbox
     let inboxId = null;
     if (inboxData.payload && inboxData.payload.length > 0) {
       const waInbox = inboxData.payload.find(
@@ -340,7 +331,6 @@ async function getOrCreateConversation(phoneNumber, contactId) {
       return null;
     }
 
-    // Create conversation
     const convRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`,
       {
@@ -360,7 +350,6 @@ async function getOrCreateConversation(phoneNumber, contactId) {
     const conversationId = convData.id;
     console.log(`[CHATWOOT] Created new conversation: ${conversationId}`);
 
-    // Update cache
     const cached2 = chatwootCache.get(phoneNumber) || {};
     cached2.conversationId = conversationId;
     chatwootCache.set(phoneNumber, cached2);
@@ -379,21 +368,18 @@ async function sendToChatwoot(phoneNumber, clientMessage, botReply) {
   }
 
   try {
-    // Get or create contact
     const { contactId } = await getOrCreateChatwootContact(phoneNumber);
     if (!contactId) {
       console.error("[CHATWOOT] Could not get/create contact");
       return;
     }
 
-    // Get or create conversation
     const conversationId = await getOrCreateConversation(phoneNumber, contactId);
     if (!conversationId) {
       console.error("[CHATWOOT] Could not get/create conversation");
       return;
     }
 
-    // Send client's message (incoming)
     await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
       {
@@ -410,7 +396,6 @@ async function sendToChatwoot(phoneNumber, clientMessage, botReply) {
       }
     );
 
-    // Send bot's reply (outgoing)
     await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
       {
@@ -429,7 +414,7 @@ async function sendToChatwoot(phoneNumber, clientMessage, botReply) {
 
     console.log(`[CHATWOOT] ✅ Messages forwarded to conversation ${conversationId}`);
 
-    // Store the mapping so agent replies can find the phone number
+    // Store mapping so agent replies can find the phone number
     chatwootToPhone.set(conversationId, phoneNumber);
 
   } catch (error) {
@@ -616,45 +601,28 @@ const MAX_REPLY_TOKENS = 400;
 // and forwards it to the customer on WhatsApp via Twilio.
 // ============================================================
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
-
-let twilioClient = null;
-if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
-  twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-  console.log("Twilio client initialized for agent replies.");
-} else {
-  console.error("WARNING: Twilio credentials not set! Agent replies via Chatwoot disabled.");
-}
-
-// Map Chatwoot conversation IDs to phone numbers so we know where to send
-const chatwootToPhone = new Map();
-
 app.post("/chatwoot-webhook", async (req, res) => {
   try {
     const event = req.body.event;
 
-    // Only care about outgoing messages (agent replies)
     if (event !== "message_created") {
       return res.status(200).send("ignored");
     }
 
     const message = req.body;
 
-    // Only process outgoing messages (from agent, not from bot or customer)
+    // Only process outgoing messages (from agent)
     // message_type: 0 = incoming, 1 = outgoing, 2 = activity
     if (message.message_type !== 1) {
       return res.status(200).send("ignored");
     }
 
-    // Ignore if the message was sent by the bot (content_attributes.external_id exists)
-    // This prevents the bot's own forwarded messages from being sent back
+    // Ignore if sent by bot (prevent loop)
     if (message.content_attributes && message.content_attributes.external_id) {
       return res.status(200).send("ignored - bot message");
     }
 
-    // Check if this is from a human agent (not API/bot)
+    // Only process messages from human agents
     const senderType = message.sender?.type;
     if (senderType !== "User") {
       return res.status(200).send("ignored - not human agent");
@@ -678,7 +646,12 @@ app.post("/chatwoot-webhook", async (req, res) => {
       }
     }
 
-    // If not in cache, try to get it from the conversation contact
+    // Also check the chatwootToPhone map
+    if (!phoneNumber) {
+      phoneNumber = chatwootToPhone.get(conversationId);
+    }
+
+    // Try to get it from the conversation contact info
     if (!phoneNumber && message.conversation?.meta?.sender?.phone_number) {
       phoneNumber = "whatsapp:" + message.conversation.meta.sender.phone_number;
     }
@@ -690,7 +663,6 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
     console.log(`[CHATWOOT-REPLY] Agent message for ${phoneNumber}: ${content.slice(0, 80)}...`);
 
-    // Send via Twilio to WhatsApp
     if (!twilioClient) {
       console.error("[CHATWOOT-REPLY] Twilio client not initialized!");
       return res.status(200).send("no twilio");
@@ -853,6 +825,7 @@ app.listen(PORT, () => {
   console.log("ATW WhatsApp Bot v5 — Chatwoot Dashboard!");
   console.log("Server is running on port " + PORT);
   console.log("Webhook URL: POST /whatsapp");
+  console.log("Chatwoot webhook: POST /chatwoot-webhook");
   console.log("Rate limit: " + RATE_LIMIT_MAX_MESSAGES + " msgs per " + (RATE_LIMIT_WINDOW_MS / 60000) + " min");
   console.log("Max message length: " + MAX_INCOMING_LENGTH + " chars");
   console.log("Max reply tokens: " + MAX_REPLY_TOKENS);
@@ -862,6 +835,5 @@ app.listen(PORT, () => {
   console.log("Alert cooldown: " + (ALERT_COOLDOWN_MS / 60000) + " min");
   console.log("Chatwoot: " + (CHATWOOT_API_URL ? "ACTIVE" : "DISABLED"));
   console.log("Agent replies via Chatwoot: " + (twilioClient ? "ACTIVE" : "DISABLED"));
-  console.log("Chatwoot webhook: POST /chatwoot-webhook");
   console.log("============================================");
 });
