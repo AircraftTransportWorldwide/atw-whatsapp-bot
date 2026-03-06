@@ -1,5 +1,5 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v3)
+// ATW WhatsApp Bot — server.js (v4)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // ============================================================
 // What this bot does:
@@ -8,42 +8,74 @@
 //   - Handles initial AOG inquiries and basic quotes
 //   - Protects against token/cost abuse
 //   - REMEMBERS conversation history per phone number
+//   - SENDS EMAIL ALERTS based on inquiry tier:
+//     Tier 1 (AOG Emergency) → immediate 🚨 alert
+//     Tier 2 (Standard Inquiry) → regular 📦 notification
+//     Tier 3 (General Question) → no email, bot handles it
 //   - Logs everything so you can monitor it
 // ============================================================
-// WHAT'S NEW IN v3:
-//   - Conversation memory: the bot now remembers previous
-//     messages in the same conversation (per phone number)
-//   - Conversations expire after 1 hour of inactivity
-//   - History is capped at the last 10 message pairs (20 msgs)
-//     to keep API costs reasonable
-//   - Memory resets on server restart (this is fine for now —
-//     Chatwoot will add permanent storage later)
+// WHAT'S NEW IN v4:
+//   - Tiered email alert system via Resend
+//   - Claude classifies each conversation automatically
+//   - Emails include AI summary + full conversation transcript
+//   - Sent from onboarding@resend.dev (upgrade to custom domain later)
 // ============================================================
 
 import express from "express";
 import fetch from "node-fetch";
 import twilio from "twilio";
+import { Resend } from "resend";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 const MessagingResponse = twilio.twiml.MessagingResponse;
 
-// ── Load API key ───────────────────────────────────────────────
+// ── Load API keys ──────────────────────────────────────────────
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 if (!CLAUDE_API_KEY) {
   console.error("============================================");
   console.error("FATAL: CLAUDE_API_KEY is NOT set!");
-  console.error("Go to Railway → your service → Variables tab");
-  console.error("and add CLAUDE_API_KEY with your Anthropic key.");
   console.error("============================================");
 } else {
   console.log("--------------------------------------------");
-  console.log("API key loaded successfully.");
+  console.log("Claude API key loaded successfully.");
   console.log("Key starts with:", CLAUDE_API_KEY.slice(0, 12) + "...");
   console.log("Key length:", CLAUDE_API_KEY.length, "characters");
   console.log("--------------------------------------------");
 }
+
+if (!RESEND_API_KEY) {
+  console.error("============================================");
+  console.error("WARNING: RESEND_API_KEY is NOT set!");
+  console.error("Email alerts will NOT work.");
+  console.error("Go to Railway → Variables → add RESEND_API_KEY");
+  console.error("============================================");
+} else {
+  console.log("Resend API key loaded successfully.");
+}
+
+// ── Initialize Resend ──────────────────────────────────────────
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+// ============================================================
+// EMAIL ALERT SETTINGS
+// ============================================================
+// Who receives the alert emails.
+// Change these to your actual ops team emails or distribution list.
+// ============================================================
+
+const ALERT_RECIPIENTS = [
+  "digital@atwcargo.com",
+  "laura@atwcargo.com",
+  "billing@diamondaircraft.us",
+];
+
+// Emails are sent FROM this address.
+// On the free Resend tier, this must be onboarding@resend.dev
+// Once you verify your domain in Resend, change to something like alerts@atwcargo.com
+const ALERT_FROM_EMAIL = "ATW Bot <onboarding@resend.dev>";
 
 // ============================================================
 // BOT PERSONALITY & RULES
@@ -89,39 +121,49 @@ CONVERSATION CONTEXT:
 IMPORTANT: If you don't know something specific, say so honestly and let them know a team member will follow up. Never make up pricing, transit times, or capabilities.`;
 
 // ============================================================
+// CLASSIFICATION PROMPT
+// ============================================================
+// This is a separate, small prompt used ONLY to classify the
+// conversation into tiers. It runs after Claude responds to the
+// customer. It's fast and cheap (~50-100 tokens).
+// ============================================================
+
+const CLASSIFICATION_PROMPT = `You are a classification system for Aircraft Transport Worldwide (ATW), an aviation freight forwarder.
+
+Analyze the following WhatsApp conversation between a client and ATW's bot. Classify it into ONE of these tiers:
+
+TIER 1 - AOG EMERGENCY: The client has an aircraft on the ground, or the situation is extremely time-critical. Keywords/signals: "AOG", "aircraft on ground", "grounded", "plane down", "critical", "emergency", "ASAP", "immediate", "need it now", "flight delayed", "aircraft waiting", or any context that implies an aircraft cannot fly until a part arrives. Also includes situations where the client explicitly says they need something urgently for an aircraft even without using the word "AOG".
+
+TIER 2 - STANDARD SHIPMENT INQUIRY: The client wants to ship aircraft parts or needs logistics services, but it's not an emergency. They're asking about pricing, routes, timelines, or requesting a quote for a planned shipment. No urgency signals.
+
+TIER 3 - GENERAL QUESTION: The client is asking general questions about ATW's services, capabilities, hours, tracking, or other informational queries that don't involve a specific shipment request.
+
+Respond ONLY with a JSON object in this exact format, no other text:
+{"tier": 1, "summary": "Client has a grounded 737 in Bogota, needs engine part P/N 1234 shipped from Miami urgently. Weight ~50kg.", "origin": "MIA", "destination": "BOG", "urgency": "CRITICAL"}
+
+Rules for the JSON:
+- "tier": must be 1, 2, or 3
+- "summary": 1-2 sentence summary of what the client needs
+- "origin": 3-letter airport/city code if mentioned, or "TBD" if not
+- "destination": 3-letter airport/city code if mentioned, or "TBD" if not
+- "urgency": "CRITICAL" for tier 1, "STANDARD" for tier 2, "INFO" for tier 3`;
+
+// ============================================================
 // CONVERSATION MEMORY
 // ============================================================
-// Stores message history per phone number so the bot remembers
-// what was said earlier in the conversation.
-//
-// How it works:
-//   - Each phone number gets an array of messages
-//   - We send the full history to Claude with each request
-//   - History is capped at MAX_HISTORY_PAIRS (10 = 20 messages)
-//   - Conversations expire after CONVERSATION_TIMEOUT_MS (1 hour)
-//   - Memory resets on server restart (in-memory only)
-//
-// Cost impact:
-//   - Instead of sending 1 message per request, we send up to 20
-//   - This roughly 2-5x your token usage per request
-//   - But it makes the bot MUCH more useful for real conversations
-// ============================================================
 
-const MAX_HISTORY_PAIRS = 10;                    // keep last 10 exchanges (20 messages)
-const CONVERSATION_TIMEOUT_MS = 60 * 60 * 1000;  // 1 hour of inactivity = new conversation
+const MAX_HISTORY_PAIRS = 10;
+const CONVERSATION_TIMEOUT_MS = 60 * 60 * 1000;
 
-// Structure: Map<sender, { messages: [...], lastActivity: timestamp }>
 const conversationHistory = new Map();
 
 function getConversation(sender) {
   const convo = conversationHistory.get(sender);
 
-  // No history exists for this number
   if (!convo) {
     return [];
   }
 
-  // Check if the conversation has expired (1 hour of silence)
   const now = Date.now();
   if (now - convo.lastActivity > CONVERSATION_TIMEOUT_MS) {
     console.log(`[MEMORY] Conversation expired for ${sender} (inactive ${Math.round((now - convo.lastActivity) / 60000)} min). Starting fresh.`);
@@ -133,16 +175,14 @@ function getConversation(sender) {
 }
 
 function addToConversation(sender, userMessage, assistantReply) {
-  const existing = getConversation(sender); // also handles expiry check
+  const existing = getConversation(sender);
 
-  // Add the new exchange
   existing.push({ role: "user", content: userMessage });
   existing.push({ role: "assistant", content: assistantReply });
 
-  // Trim to max history (keep the most recent pairs)
   while (existing.length > MAX_HISTORY_PAIRS * 2) {
-    existing.shift(); // remove oldest message
-    existing.shift(); // remove its pair
+    existing.shift();
+    existing.shift();
   }
 
   conversationHistory.set(sender, {
@@ -154,8 +194,6 @@ function addToConversation(sender, userMessage, assistantReply) {
 }
 
 // ── Cleanup old conversations periodically ─────────────────────
-// Runs every 30 minutes to prevent memory buildup from numbers
-// that chatted once and never came back.
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
@@ -169,6 +207,195 @@ setInterval(() => {
     console.log(`[MEMORY] Cleanup: removed ${cleaned} expired conversations. Active: ${conversationHistory.size}`);
   }
 }, 30 * 60 * 1000);
+
+// ============================================================
+// EMAIL ALERT SYSTEM
+// ============================================================
+// Classifies the conversation and sends email alerts for
+// Tier 1 (AOG) and Tier 2 (Standard) inquiries.
+// Tier 3 (General) gets no email.
+//
+// This runs AFTER the bot has already replied to the customer,
+// so it doesn't slow down the WhatsApp response.
+// ============================================================
+
+// Track which conversations have already triggered an email
+// so we don't spam the ops team with repeat alerts.
+// Key: sender phone number, Value: { tier, timestamp }
+const alertsSent = new Map();
+
+// Don't send another alert for the same conversation within this window
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+function hasRecentAlert(sender, tier) {
+  const prev = alertsSent.get(sender);
+  if (!prev) return false;
+
+  const now = Date.now();
+  // If same tier and within cooldown, skip
+  if (prev.tier === tier && now - prev.timestamp < ALERT_COOLDOWN_MS) {
+    return true;
+  }
+  // If conversation escalated from tier 2 to tier 1, always send
+  if (tier === 1 && prev.tier === 2) {
+    return false;
+  }
+  return false;
+}
+
+async function classifyAndAlert(sender, messages) {
+  if (!resend) {
+    console.log("[EMAIL] Resend not configured, skipping classification.");
+    return;
+  }
+
+  try {
+    // ── Build conversation transcript for classification ──────
+    const transcript = messages
+      .map((m) => `${m.role === "user" ? "CLIENT" : "ATW BOT"}: ${m.content}`)
+      .join("\n");
+
+    // ── Ask Claude to classify the conversation ────────────────
+    const classifyResponse = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 200,
+        system: CLASSIFICATION_PROMPT,
+        messages: [{ role: "user", content: transcript }],
+      }),
+    });
+
+    const classifyData = await classifyResponse.json();
+
+    if (!classifyResponse.ok) {
+      console.error("[EMAIL] Classification API error:", JSON.stringify(classifyData));
+      return;
+    }
+
+    const rawText = classifyData?.content?.[0]?.text || "";
+    console.log("[EMAIL] Classification raw:", rawText);
+
+    // ── Parse the classification ───────────────────────────────
+    let classification;
+    try {
+      // Clean up in case Claude wraps it in backticks
+      const cleaned = rawText.replace(/```json|```/g, "").trim();
+      classification = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.error("[EMAIL] Failed to parse classification:", rawText);
+      return;
+    }
+
+    const tier = classification.tier;
+    const summary = classification.summary || "No summary available";
+    const origin = classification.origin || "TBD";
+    const destination = classification.destination || "TBD";
+    const urgency = classification.urgency || "UNKNOWN";
+
+    console.log(`[EMAIL] Tier ${tier} | ${origin} → ${destination} | ${urgency}`);
+
+    // ── Tier 3: No email needed ────────────────────────────────
+    if (tier === 3) {
+      console.log("[EMAIL] Tier 3 (general question) — no email sent.");
+      return;
+    }
+
+    // ── Check cooldown ─────────────────────────────────────────
+    if (hasRecentAlert(sender, tier)) {
+      console.log(`[EMAIL] Alert already sent for ${sender} (tier ${tier}) within cooldown. Skipping.`);
+      return;
+    }
+
+    // ── Format the phone number for display ────────────────────
+    const phoneDisplay = sender.replace("whatsapp:", "");
+
+    // ── Build email subject ────────────────────────────────────
+    let subject;
+    if (tier === 1) {
+      subject = `🚨 AOG ALERT — ${origin} → ${destination} — ${phoneDisplay}`;
+    } else {
+      subject = `📦 New Shipment Inquiry — ${origin} → ${destination} — ${phoneDisplay}`;
+    }
+
+    // ── Build email body (HTML) ────────────────────────────────
+    const tierLabel = tier === 1 ? "🚨 TIER 1 — AOG EMERGENCY" : "📦 TIER 2 — STANDARD INQUIRY";
+    const tierColor = tier === 1 ? "#dc2626" : "#2563eb";
+
+    const transcriptHtml = messages
+      .map((m) => {
+        const label = m.role === "user" ? "CLIENT" : "ATW BOT";
+        const color = m.role === "user" ? "#1e40af" : "#166534";
+        return `<p><strong style="color: ${color}">${label}:</strong> ${m.content}</p>`;
+      })
+      .join("");
+
+    const emailHtml = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background: ${tierColor}; color: white; padding: 16px 24px; border-radius: 8px 8px 0 0;">
+          <h2 style="margin: 0; font-size: 18px;">${tierLabel}</h2>
+        </div>
+        
+        <div style="background: #f8fafc; padding: 24px; border: 1px solid #e2e8f0;">
+          <h3 style="margin: 0 0 12px 0; color: #334155;">Summary</h3>
+          <p style="margin: 0 0 16px 0; font-size: 16px; color: #1e293b;">${summary}</p>
+          
+          <table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;"><strong>Client Phone:</strong></td>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${phoneDisplay}</td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;"><strong>Origin:</strong></td>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${origin}</td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;"><strong>Destination:</strong></td>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${destination}</td>
+            </tr>
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;"><strong>Urgency:</strong></td>
+              <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${urgency}</td>
+            </tr>
+          </table>
+        </div>
+
+        <div style="background: white; padding: 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 8px 8px;">
+          <h3 style="margin: 0 0 12px 0; color: #334155;">Full Conversation</h3>
+          <div style="background: #f1f5f9; padding: 16px; border-radius: 8px; font-size: 14px;">
+            ${transcriptHtml}
+          </div>
+        </div>
+
+        <p style="color: #94a3b8; font-size: 12px; text-align: center; margin-top: 16px;">
+          Sent automatically by ATW WhatsApp Bot v4 — ${new Date().toISOString()}
+        </p>
+      </div>
+    `;
+
+    // ── Send the email via Resend ──────────────────────────────
+    const emailResult = await resend.emails.send({
+      from: ALERT_FROM_EMAIL,
+      to: ALERT_RECIPIENTS,
+      subject: subject,
+      html: emailHtml,
+    });
+
+    console.log(`[EMAIL] ✅ Tier ${tier} alert sent! ID: ${emailResult?.data?.id}`);
+
+    // Record that we sent an alert for this sender
+    alertsSent.set(sender, { tier, timestamp: Date.now() });
+
+  } catch (error) {
+    // Email errors should NEVER break the bot's WhatsApp response
+    console.error("[EMAIL] Alert error (non-fatal):", error.message);
+  }
+}
 
 // ============================================================
 // TOKEN ABUSE PROTECTION
@@ -198,7 +425,7 @@ const MAX_REPLY_TOKENS = 400;
 
 // ── Health check endpoint ──────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send("ATW WhatsApp Bot v3 is running. Active conversations: " + conversationHistory.size);
+  res.send("ATW WhatsApp Bot v4 is running. Active conversations: " + conversationHistory.size);
 });
 
 // ── Main WhatsApp webhook ──────────────────────────────────────
@@ -258,8 +485,8 @@ app.post("/whatsapp", async (req, res) => {
 
     // ── Build messages array with history + new message ────────
     const messages = [
-      ...history,                                    // previous messages (if any)
-      { role: "user", content: incomingMsg },        // current message
+      ...history,
+      { role: "user", content: incomingMsg },
     ];
 
     // ── Build the API request ──────────────────────────────────
@@ -267,7 +494,7 @@ app.post("/whatsapp", async (req, res) => {
       model: "claude-sonnet-4-20250514",
       max_tokens: MAX_REPLY_TOKENS,
       system: SYSTEM_PROMPT,
-      messages: messages,   // <-- now includes full conversation history
+      messages: messages,
     };
 
     console.log("Sending to Claude API with", messages.length, "messages...");
@@ -324,6 +551,14 @@ app.post("/whatsapp", async (req, res) => {
     res.end(twiml.toString());
     console.log("Reply sent successfully.");
 
+    // ── Classify and send email alert (runs in background) ─────
+    // This happens AFTER the WhatsApp reply is sent, so it
+    // doesn't slow down the customer's experience.
+    const fullConversation = [...history, { role: "user", content: incomingMsg }, { role: "assistant", content: reply }];
+    classifyAndAlert(sender, fullConversation).catch((err) => {
+      console.error("[EMAIL] Background alert error:", err.message);
+    });
+
   } catch (error) {
     console.error("========== CAUGHT ERROR ==========");
     console.error("Error:", error.message);
@@ -341,12 +576,15 @@ app.post("/whatsapp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v3 — Now with memory!");
+  console.log("ATW WhatsApp Bot v4 — Tiered Email Alerts!");
   console.log("Server is running on port " + PORT);
   console.log("Webhook URL: POST /whatsapp");
   console.log("Rate limit: " + RATE_LIMIT_MAX_MESSAGES + " msgs per " + (RATE_LIMIT_WINDOW_MS / 60000) + " min");
   console.log("Max message length: " + MAX_INCOMING_LENGTH + " chars");
   console.log("Max reply tokens: " + MAX_REPLY_TOKENS);
   console.log("Conversation memory: last " + MAX_HISTORY_PAIRS + " exchanges, " + (CONVERSATION_TIMEOUT_MS / 60000) + " min timeout");
+  console.log("Email alerts: " + (resend ? "ACTIVE" : "DISABLED (no Resend key)"));
+  console.log("Alert recipients: " + ALERT_RECIPIENTS.join(", "));
+  console.log("Alert cooldown: " + (ALERT_COOLDOWN_MS / 60000) + " min");
   console.log("============================================");
 });
