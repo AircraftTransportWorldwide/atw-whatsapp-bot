@@ -68,8 +68,10 @@ const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 const ALERT_RECIPIENTS = [
   "digital@atwcargo.com",
-  "laura@atwcargo.com",
-  "billing@diamondaircraft.us",
+  // TEMPORARILY limited to one email until domain is verified in Resend.
+  // Once verified, uncomment these:
+  // "laura@atwcargo.com",
+  // "billing@diamondaircraft.us",
 ];
 
 // Emails are sent FROM this address.
