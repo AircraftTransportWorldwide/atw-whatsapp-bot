@@ -652,8 +652,9 @@ app.post("/chatwoot-webhook", async (req, res) => {
     }
 
     // Try to get it from the conversation contact info
-    if (!phoneNumber && message.conversation?.meta?.sender?.phone_number) {
-      phoneNumber = "whatsapp:" + message.conversation.meta.sender.phone_number;
+if (!phoneNumber && message.conversation?.meta?.sender?.phone_number) {
+  phoneNumber = "whatsapp:" + message.conversation.meta.sender.phone_number;
+}
     }
 
     if (!phoneNumber) {
