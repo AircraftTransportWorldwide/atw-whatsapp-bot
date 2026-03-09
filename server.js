@@ -609,7 +609,7 @@ app.post("/chatwoot-webhook", async (req, res) => {
       return res.status(200).send("ignored");
     }
 
-    const message = req.body;
+    const message = req.body.message || req.body;
 
     // Only process outgoing messages (from agent)
     // message_type: 0 = incoming, 1 = outgoing, 2 = activity
