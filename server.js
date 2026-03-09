@@ -658,7 +658,9 @@ if (!phoneNumber) {
     message.conversation?.meta?.sender?.identifier;
 
   if (phone) {
-    phoneNumber = "whatsapp:" + phone;
+    phoneNumber = phone.startsWith("whatsapp:")
+  ? phone
+  : "whatsapp:" + phone;
   }
 }
 
