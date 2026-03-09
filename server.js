@@ -647,21 +647,25 @@ app.post("/chatwoot-webhook", async (req, res) => {
     }
 
     // Also check the chatwootToPhone map
-    if (!phoneNumber) {
-      phoneNumber = chatwootToPhone.get(conversationId);
-    }
-
-    // Try to get it from the conversation contact info
-if (!phoneNumber && message.conversation?.meta?.sender?.phone_number) {
-  phoneNumber = "whatsapp:" + message.conversation.meta.sender.phone_number;
+if (!phoneNumber) {
+  phoneNumber = chatwootToPhone.get(conversationId);
 }
-    }
 
-    if (!phoneNumber) {
-      console.error("[CHATWOOT-REPLY] Could not find phone number for conversation:", conversationId);
-      return res.status(200).send("no phone");
-    }
+// Try to get it from the conversation contact info
+if (!phoneNumber) {
+  const phone =
+    message.conversation?.meta?.sender?.phone_number ||
+    message.conversation?.meta?.sender?.identifier;
 
+  if (phone) {
+    phoneNumber = "whatsapp:" + phone;
+  }
+}
+
+if (!phoneNumber) {
+  console.error("[CHATWOOT-REPLY] Could not find phone number for conversation:", conversationId);
+  return res.status(200).send("no phone");
+}
     console.log(`[CHATWOOT-REPLY] Agent message for ${phoneNumber}: ${content.slice(0, 80)}...`);
 
     if (!twilioClient) {
