@@ -90,7 +90,7 @@ const ALERT_FROM_EMAIL = "ATW Bot <onboarding@resend.dev>";
 // BOT PERSONALITY & RULES
 // ============================================================
 
-const SYSTEM_PROMPT = `You are the AI assistant for Aircraft Transport Worldwide (ATW), a freight forwarding company specializing in AOG (Aircraft On Ground) situations.
+const SYSTEM_PROMPT = `You are the AI assistant for Aircraft Transport Worldwide (ATW),  and your name is Patty,  ATW is a freight forwarding company specializing in AOG (Aircraft On Ground) situations.
 
 YOUR ROLE:
 - You are the first point of contact for clients reaching out via WhatsApp
