@@ -610,10 +610,10 @@ app.post("/chatwoot-webhook", async (req, res) => {
     }
 
     const message = req.body.message || req.body;
-
+    console.log("CHATWOOT PAYLOAD:", JSON.stringify(req.body, null, 2));
     // Only process outgoing messages (from agent)
     // message_type: 0 = incoming, 1 = outgoing, 2 = activity
-    if (message.message_type !== 1) {
+    if (Number(message.message_type) !== 1) {
       return res.status(200).send("ignored");
     }
 
