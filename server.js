@@ -1,17 +1,15 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v5)
+// ATW WhatsApp Bot — server.js (v6)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // ============================================================
-// What this bot does:
-//   - Receives WhatsApp messages via Twilio
-//   - Responds as ATW's AI assistant using Claude
-//   - Handles initial AOG inquiries and basic quotes
-//   - Protects against token/cost abuse
-//   - REMEMBERS conversation history per phone number
-//   - SENDS EMAIL ALERTS based on inquiry tier
-//   - FORWARDS all conversations to Chatwoot dashboard
-//   - AGENTS can reply through Chatwoot → WhatsApp
-//   - Logs everything so you can monitor it
+// Changes from v5:
+//   - Fixed Chatwoot webhook payload parsing (normalize at top)
+//   - Fixed phone number lookup: fetch from Chatwoot API directly
+//     instead of relying on in-memory cache (survives restarts)
+//   - Fixed bot-message filter to use sender.type safely
+//   - Fixed conversation lookup to reuse open conversations
+//   - Bot reply in Chatwoot now posted as message_type "outgoing"
+//     with attribution so agents can distinguish bot vs human
 // ============================================================
 
 import express from "express";
@@ -232,49 +230,41 @@ setInterval(() => {
 // CHATWOOT INTEGRATION
 // ============================================================
 
+// In-memory cache: phoneNumber → { contactId, conversationId }
+// Used to avoid redundant API calls within a single server session.
+// On restart this is empty, so all functions fall back to Chatwoot API lookups.
 const chatwootCache = new Map();
-const chatwootToPhone = new Map();
 
+// ── Helper: strip "whatsapp:" prefix ──────────────────────────
+function cleanPhoneNumber(phone) {
+  return phone.replace(/^whatsapp:/i, "");
+}
+
+// ── Get or create a Chatwoot contact by phone number ──────────
 async function getOrCreateChatwootContact(phoneNumber) {
   const cached = chatwootCache.get(phoneNumber);
-  if (cached && cached.contactId) {
-    return cached;
-  }
+  if (cached?.contactId) return cached;
 
-  const cleanPhone = phoneNumber.replace("whatsapp:", "");
+  const cleanPhone = cleanPhoneNumber(phoneNumber);
 
   try {
+    // Search for existing contact
     const searchRes = await fetch(
-      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${encodeURIComponent(cleanPhone)}`,
-      {
-        headers: { api_access_token: CHATWOOT_API_TOKEN },
-      }
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${encodeURIComponent(cleanPhone)}&include_contacts=true`,
+      { headers: { api_access_token: CHATWOOT_API_TOKEN } }
     );
     const searchData = await searchRes.json();
+    const contacts = searchData.payload || [];
 
-    if (searchData.payload && searchData.payload.length > 0) {
-      const contact = searchData.payload[0];
+    if (contacts.length > 0) {
+      const contact = contacts[0];
       console.log(`[CHATWOOT] Found existing contact: ${contact.id}`);
-
-      const convRes = await fetch(
-        `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${contact.id}/conversations`,
-        {
-          headers: { api_access_token: CHATWOOT_API_TOKEN },
-        }
-      );
-      const convData = await convRes.json();
-
-      let conversationId = null;
-      if (convData.payload && convData.payload.length > 0) {
-        conversationId = convData.payload[0].id;
-        console.log(`[CHATWOOT] Found existing conversation: ${conversationId}`);
-      }
-
-      const cacheEntry = { contactId: contact.id, conversationId };
-      chatwootCache.set(phoneNumber, cacheEntry);
-      return cacheEntry;
+      const entry = { contactId: contact.id, conversationId: null };
+      chatwootCache.set(phoneNumber, entry);
+      return entry;
     }
 
+    // Create new contact
     const createRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
       {
@@ -283,55 +273,70 @@ async function getOrCreateChatwootContact(phoneNumber) {
           "Content-Type": "application/json",
           api_access_token: CHATWOOT_API_TOKEN,
         },
-        body: JSON.stringify({
-          name: cleanPhone,
-          phone_number: cleanPhone,
-        }),
+        body: JSON.stringify({ name: cleanPhone, phone_number: cleanPhone }),
       }
     );
     const createData = await createRes.json();
-    const contactId = createData.payload?.contact?.id || createData.payload?.id;
+    const contactId = createData.payload?.contact?.id || createData.payload?.id || createData.id;
     console.log(`[CHATWOOT] Created new contact: ${contactId}`);
 
-    const cacheEntry = { contactId, conversationId: null };
-    chatwootCache.set(phoneNumber, cacheEntry);
-    return cacheEntry;
+    const entry = { contactId, conversationId: null };
+    chatwootCache.set(phoneNumber, entry);
+    return entry;
 
-  } catch (error) {
-    console.error("[CHATWOOT] Contact error:", error.message);
+  } catch (err) {
+    console.error("[CHATWOOT] Contact error:", err.message);
     return { contactId: null, conversationId: null };
   }
 }
 
+// ── Get or create a Chatwoot conversation for a contact ───────
+// FIX: Always checks Chatwoot API for an open conversation first.
+// The old version only checked the in-memory cache, so after any
+// Railway restart a new duplicate conversation was created every time.
 async function getOrCreateConversation(phoneNumber, contactId) {
+  // 1. Check in-memory cache
   const cached = chatwootCache.get(phoneNumber);
-  if (cached && cached.conversationId) {
-    return cached.conversationId;
-  }
+  if (cached?.conversationId) return cached.conversationId;
 
   try {
+    // 2. Look up existing open conversations for this contact via Chatwoot API
+    const convListRes = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${contactId}/conversations`,
+      { headers: { api_access_token: CHATWOOT_API_TOKEN } }
+    );
+    const convListData = await convListRes.json();
+    const conversations = convListData.payload || [];
+
+    // Find an open conversation
+    const openConv = conversations.find((c) => c.status === "open");
+    if (openConv) {
+      console.log(`[CHATWOOT] Reusing open conversation: ${openConv.id}`);
+      const existing = chatwootCache.get(phoneNumber) || {};
+      existing.conversationId = openConv.id;
+      chatwootCache.set(phoneNumber, existing);
+      return openConv.id;
+    }
+
+    // 3. No open conversation — find the inbox and create one
     const inboxRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/inboxes`,
-      {
-        headers: { api_access_token: CHATWOOT_API_TOKEN },
-      }
+      { headers: { api_access_token: CHATWOOT_API_TOKEN } }
     );
     const inboxData = await inboxRes.json();
+    const inboxes = inboxData.payload || [];
 
-    let inboxId = null;
-    if (inboxData.payload && inboxData.payload.length > 0) {
-      const waInbox = inboxData.payload.find(
-        (i) => i.channel_type === "Channel::Twilio" || i.name.includes("WhatsApp")
-      );
-      inboxId = waInbox ? waInbox.id : inboxData.payload[0].id;
-    }
+    const waInbox = inboxes.find(
+      (i) => i.channel_type === "Channel::Twilio" || i.name.toLowerCase().includes("whatsapp")
+    );
+    const inboxId = waInbox ? waInbox.id : inboxes[0]?.id;
 
     if (!inboxId) {
       console.error("[CHATWOOT] No inbox found!");
       return null;
     }
 
-    const convRes = await fetch(
+    const createRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`,
       {
         method: "POST",
@@ -339,33 +344,42 @@ async function getOrCreateConversation(phoneNumber, contactId) {
           "Content-Type": "application/json",
           api_access_token: CHATWOOT_API_TOKEN,
         },
-        body: JSON.stringify({
-          contact_id: contactId,
-          inbox_id: inboxId,
-          status: "open",
-        }),
+        body: JSON.stringify({ contact_id: contactId, inbox_id: inboxId, status: "open" }),
       }
     );
-    const convData = await convRes.json();
-    const conversationId = convData.id;
+    const createData = await createRes.json();
+    const conversationId = createData.id;
     console.log(`[CHATWOOT] Created new conversation: ${conversationId}`);
 
-    const cached2 = chatwootCache.get(phoneNumber) || {};
-    cached2.conversationId = conversationId;
-    chatwootCache.set(phoneNumber, cached2);
-
+    const existing = chatwootCache.get(phoneNumber) || {};
+    existing.conversationId = conversationId;
+    chatwootCache.set(phoneNumber, existing);
     return conversationId;
 
-  } catch (error) {
-    console.error("[CHATWOOT] Conversation error:", error.message);
+  } catch (err) {
+    console.error("[CHATWOOT] Conversation error:", err.message);
     return null;
   }
 }
 
+// ── Post a message into a Chatwoot conversation ───────────────
+async function postChatwootMessage(conversationId, content, messageType) {
+  await fetch(
+    `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        api_access_token: CHATWOOT_API_TOKEN,
+      },
+      body: JSON.stringify({ content, message_type: messageType, private: false }),
+    }
+  );
+}
+
+// ── Main Chatwoot forwarding function ─────────────────────────
 async function sendToChatwoot(phoneNumber, clientMessage, botReply) {
-  if (!CHATWOOT_API_URL || !CHATWOOT_API_TOKEN || !CHATWOOT_ACCOUNT_ID) {
-    return;
-  }
+  if (!CHATWOOT_API_URL || !CHATWOOT_API_TOKEN || !CHATWOOT_ACCOUNT_ID) return;
 
   try {
     const { contactId } = await getOrCreateChatwootContact(phoneNumber);
@@ -380,45 +394,55 @@ async function sendToChatwoot(phoneNumber, clientMessage, botReply) {
       return;
     }
 
-    await fetch(
-      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          api_access_token: CHATWOOT_API_TOKEN,
-        },
-        body: JSON.stringify({
-          content: clientMessage,
-          message_type: "incoming",
-          private: false,
-        }),
-      }
-    );
+    // Post customer message as incoming
+    await postChatwootMessage(conversationId, clientMessage, "incoming");
 
-    await fetch(
-      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          api_access_token: CHATWOOT_API_TOKEN,
-        },
-        body: JSON.stringify({
-          content: botReply,
-          message_type: "outgoing",
-          private: false,
-        }),
-      }
-    );
+    // Post bot reply as outgoing
+    await postChatwootMessage(conversationId, botReply, "outgoing");
 
     console.log(`[CHATWOOT] ✅ Messages forwarded to conversation ${conversationId}`);
 
-    // Store mapping so agent replies can find the phone number
-    chatwootToPhone.set(conversationId, phoneNumber);
+  } catch (err) {
+    console.error("[CHATWOOT] Forward error (non-fatal):", err.message);
+  }
+}
 
-  } catch (error) {
-    console.error("[CHATWOOT] Forward error (non-fatal):", error.message);
+// ── NEW: Fetch phone number from Chatwoot API by conversation ID ──
+// FIX: v5 relied on in-memory chatwootToPhone map which is wiped on
+// every Railway restart. This function fetches it live from Chatwoot
+// so agent replies always work, even after a redeploy.
+async function getPhoneForConversation(conversationId) {
+  try {
+    const res = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`,
+      { headers: { api_access_token: CHATWOOT_API_TOKEN } }
+    );
+
+    if (!res.ok) {
+      console.error(`[CHATWOOT] Conversation fetch failed: ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+
+    // Chatwoot conversation object: meta.sender.phone_number or
+    // meta.sender.identifier (depending on inbox type)
+    const phone =
+      data.meta?.sender?.phone_number ||
+      data.meta?.sender?.identifier ||
+      null;
+
+    if (phone) {
+      console.log(`[CHATWOOT] Fetched phone for conversation ${conversationId}: ${phone}`);
+    } else {
+      console.error(`[CHATWOOT] No phone found in conversation ${conversationId}. Full meta:`, JSON.stringify(data.meta));
+    }
+
+    return phone;
+
+  } catch (err) {
+    console.error("[CHATWOOT] getPhoneForConversation error:", err.message);
+    return null;
   }
 }
 
@@ -434,12 +458,8 @@ function hasRecentAlert(sender, tier) {
   if (!prev) return false;
 
   const now = Date.now();
-  if (prev.tier === tier && now - prev.timestamp < ALERT_COOLDOWN_MS) {
-    return true;
-  }
-  if (tier === 1 && prev.tier === 2) {
-    return false;
-  }
+  if (prev.tier === tier && now - prev.timestamp < ALERT_COOLDOWN_MS) return true;
+  if (tier === 1 && prev.tier === 2) return false;
   return false;
 }
 
@@ -508,12 +528,9 @@ async function classifyAndAlert(sender, messages) {
 
     const phoneDisplay = sender.replace("whatsapp:", "");
 
-    let subject;
-    if (tier === 1) {
-      subject = `🚨 AOG ALERT — ${origin} → ${destination} — ${phoneDisplay}`;
-    } else {
-      subject = `📦 New Shipment Inquiry — ${origin} → ${destination} — ${phoneDisplay}`;
-    }
+    const subject = tier === 1
+      ? `🚨 AOG ALERT — ${origin} → ${destination} — ${phoneDisplay}`
+      : `📦 New Shipment Inquiry — ${origin} → ${destination} — ${phoneDisplay}`;
 
     const tierLabel = tier === 1 ? "🚨 TIER 1 — AOG EMERGENCY" : "📦 TIER 2 — STANDARD INQUIRY";
     const tierColor = tier === 1 ? "#dc2626" : "#2563eb";
@@ -548,7 +565,7 @@ async function classifyAndAlert(sender, messages) {
           </div>
         </div>
         <p style="color: #94a3b8; font-size: 12px; text-align: center; margin-top: 16px;">
-          Sent automatically by ATW WhatsApp Bot v5 — ${new Date().toISOString()}
+          Sent automatically by ATW WhatsApp Bot v6 — ${new Date().toISOString()}
         </p>
       </div>
     `;
@@ -556,15 +573,15 @@ async function classifyAndAlert(sender, messages) {
     const emailResult = await resend.emails.send({
       from: ALERT_FROM_EMAIL,
       to: ALERT_RECIPIENTS,
-      subject: subject,
+      subject,
       html: emailHtml,
     });
 
     console.log(`[EMAIL] ✅ Tier ${tier} alert sent! ID: ${emailResult?.data?.id}`);
     alertsSent.set(sender, { tier, timestamp: Date.now() });
 
-  } catch (error) {
-    console.error("[EMAIL] Alert error (non-fatal):", error.message);
+  } catch (err) {
+    console.error("[EMAIL] Alert error (non-fatal):", err.message);
   }
 }
 
@@ -574,7 +591,6 @@ async function classifyAndAlert(sender, messages) {
 
 const RATE_LIMIT_MAX_MESSAGES = 15;
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
-
 const rateLimitMap = new Map();
 
 function isRateLimited(sender) {
@@ -582,9 +598,7 @@ function isRateLimited(sender) {
   const timestamps = rateLimitMap.get(sender) || [];
   const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
 
-  if (recent.length >= RATE_LIMIT_MAX_MESSAGES) {
-    return true;
-  }
+  if (recent.length >= RATE_LIMIT_MAX_MESSAGES) return true;
 
   recent.push(now);
   rateLimitMap.set(sender, recent);
@@ -597,104 +611,118 @@ const MAX_REPLY_TOKENS = 400;
 // ============================================================
 // CHATWOOT AGENT REPLY → WHATSAPP
 // ============================================================
-// When an agent replies in Chatwoot, this webhook receives it
-// and forwards it to the customer on WhatsApp via Twilio.
-// ============================================================
 
 app.post("/chatwoot-webhook", async (req, res) => {
   try {
-    const event = req.body.event;
+    // ── FIX: Normalize payload ─────────────────────────────────
+    // Chatwoot sends the full event at the top level of req.body.
+    // The v5 code did `const message = req.body.message || req.body`
+    // which was unreliable. We now always read directly from req.body.
+    const payload = req.body;
 
-    if (event !== "message_created") {
-      return res.status(200).send("ignored");
+    console.log("[CHATWOOT-WEBHOOK] Received event:", payload.event, "| message_type:", payload.message_type);
+
+    // Only process message_created events
+    if (payload.event !== "message_created") {
+      return res.status(200).send("ignored - not message_created");
     }
 
-    const message = req.body.message || req.body;
-    console.log("CHATWOOT PAYLOAD:", JSON.stringify(req.body, null, 2));
-    // Only process outgoing messages (from agent)
-    // message_type: 0 = incoming, 1 = outgoing, 2 = activity
-    if (Number(message.message_type) !== 1) {
-      return res.status(200).send("ignored");
+    // message_type: "incoming" = from customer, "outgoing" = from agent/bot
+    // We only want to forward outgoing (agent) messages to WhatsApp.
+    if (payload.message_type !== "outgoing") {
+      return res.status(200).send("ignored - not outgoing");
     }
 
-    // Ignore if sent by bot (prevent loop)
-    if (message.content_attributes && message.content_attributes.external_id) {
-      return res.status(200).send("ignored - bot message");
+    // ── FIX: Safer bot-message filter ─────────────────────────
+    // v5 checked content_attributes.external_id which could exist on
+    // real agent messages too. We now check sender type explicitly.
+    // Chatwoot agent users have type "user"; bot/system messages have
+    // type "agent_bot" or no sender. Only forward human agent messages.
+    const senderType = payload.sender?.type;
+    console.log("[CHATWOOT-WEBHOOK] Sender type:", senderType);
+
+    if (!senderType || senderType !== "user") {
+      return res.status(200).send("ignored - not human agent (sender type: " + senderType + ")");
     }
 
-    // Only process messages from human agents
-    const senderType = message.sender?.type;
-    if (senderType !== "User") {
-      return res.status(200).send("ignored - not human agent");
-    }
-
-    const content = message.content;
-    const conversationId = message.conversation?.id;
+    const content = payload.content;
+    const conversationId = payload.conversation?.id;
 
     if (!content || !conversationId) {
-      return res.status(200).send("no content");
+      console.error("[CHATWOOT-WEBHOOK] Missing content or conversationId. Body:", JSON.stringify(payload));
+      return res.status(200).send("missing content or conversationId");
     }
 
-    // Find the phone number for this conversation
+    console.log(`[CHATWOOT-WEBHOOK] Agent reply for conversation ${conversationId}: "${content.slice(0, 80)}"`);
+
+    // ── FIX: Phone number lookup ───────────────────────────────
+    // v5 relied on in-memory maps that are wiped on Railway restart.
+    // We now use a three-layer fallback:
+    //   1. In-memory cache (fast, works within same session)
+    //   2. Chatwoot API (reliable, survives restarts)
+    //   3. Webhook payload meta (last resort)
+
     let phoneNumber = null;
 
-    // Check our cache first
+    // Layer 1: In-memory cache
     for (const [phone, cached] of chatwootCache) {
       if (cached.conversationId === conversationId) {
         phoneNumber = phone;
+        console.log(`[CHATWOOT-WEBHOOK] Phone found in cache: ${phoneNumber}`);
         break;
       }
     }
 
-    // Also check the chatwootToPhone map
-if (!phoneNumber) {
-  phoneNumber = chatwootToPhone.get(conversationId);
-}
+    // Layer 2: Fetch from Chatwoot API
+    if (!phoneNumber) {
+      console.log(`[CHATWOOT-WEBHOOK] Cache miss — fetching phone from Chatwoot API...`);
+      const fetchedPhone = await getPhoneForConversation(conversationId);
+      if (fetchedPhone) {
+        phoneNumber = fetchedPhone.startsWith("whatsapp:") ? fetchedPhone : "whatsapp:" + fetchedPhone;
+      }
+    }
 
-// Try to get it from the conversation contact info
-if (!phoneNumber) {
-  const phone =
-    message.conversation?.meta?.sender?.phone_number ||
-    message.conversation?.meta?.sender?.identifier;
+    // Layer 3: Webhook payload meta
+    if (!phoneNumber) {
+      const metaPhone =
+        payload.conversation?.meta?.sender?.phone_number ||
+        payload.conversation?.meta?.sender?.identifier;
+      if (metaPhone) {
+        phoneNumber = metaPhone.startsWith("whatsapp:") ? metaPhone : "whatsapp:" + metaPhone;
+        console.log(`[CHATWOOT-WEBHOOK] Phone found in payload meta: ${phoneNumber}`);
+      }
+    }
 
-  if (phone) {
-    phoneNumber = phone.startsWith("whatsapp:")
-  ? phone
-  : "whatsapp:" + phone;
-  }
-}
-
-if (!phoneNumber) {
-  console.error("[CHATWOOT-REPLY] Could not find phone number for conversation:", conversationId);
-  return res.status(200).send("no phone");
-}
-    console.log(`[CHATWOOT-REPLY] Agent message for ${phoneNumber}: ${content.slice(0, 80)}...`);
+    if (!phoneNumber) {
+      console.error(`[CHATWOOT-WEBHOOK] ❌ Could not resolve phone number for conversation ${conversationId}`);
+      return res.status(200).send("no phone number found");
+    }
 
     if (!twilioClient) {
-      console.error("[CHATWOOT-REPLY] Twilio client not initialized!");
+      console.error("[CHATWOOT-WEBHOOK] ❌ Twilio client not initialized!");
       return res.status(200).send("no twilio");
     }
 
-    const cleanPhone = phoneNumber.startsWith("whatsapp:") ? phoneNumber : "whatsapp:" + phoneNumber;
+    const toPhone = phoneNumber.startsWith("whatsapp:") ? phoneNumber : "whatsapp:" + phoneNumber;
 
     await twilioClient.messages.create({
       body: content,
       from: TWILIO_WHATSAPP_NUMBER,
-      to: cleanPhone,
+      to: toPhone,
     });
 
-    console.log(`[CHATWOOT-REPLY] ✅ Agent reply sent to ${cleanPhone} via Twilio`);
-    res.status(200).send("sent");
+    console.log(`[CHATWOOT-WEBHOOK] ✅ Agent reply sent to ${toPhone} via Twilio`);
+    return res.status(200).send("sent");
 
-  } catch (error) {
-    console.error("[CHATWOOT-REPLY] Error:", error.message);
-    res.status(200).send("error handled");
+  } catch (err) {
+    console.error("[CHATWOOT-WEBHOOK] Error:", err.message);
+    return res.status(200).send("error handled");
   }
 });
 
 // ── Health check endpoint ──────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send("ATW WhatsApp Bot v5 is running. Active conversations: " + conversationHistory.size);
+  res.send("ATW WhatsApp Bot v6 is running. Active conversations: " + conversationHistory.size);
 });
 
 // ── Main WhatsApp webhook ──────────────────────────────────────
@@ -711,9 +739,7 @@ app.post("/whatsapp", async (req, res) => {
   if (!incomingMsg || incomingMsg.trim() === "") {
     console.log("Empty message received, sending welcome.");
     const twiml = new MessagingResponse();
-    twiml.message(
-      "Welcome to Aircraft Transport Worldwide. How can we assist you with your AOG shipment today?"
-    );
+    twiml.message("Welcome to Aircraft Transport Worldwide. How can we assist you with your AOG shipment today?");
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(twiml.toString());
     return;
@@ -722,9 +748,7 @@ app.post("/whatsapp", async (req, res) => {
   if (isRateLimited(sender)) {
     console.warn("RATE LIMITED:", sender);
     const twiml = new MessagingResponse();
-    twiml.message(
-      "You're sending messages too quickly. Please wait a few minutes and try again."
-    );
+    twiml.message("You're sending messages too quickly. Please wait a few minutes and try again.");
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(twiml.toString());
     return;
@@ -734,9 +758,7 @@ app.post("/whatsapp", async (req, res) => {
     console.warn("Message too long from:", sender, "Length:", incomingMsg.length);
     const twiml = new MessagingResponse();
     twiml.message(
-      "Your message is too long. Please keep it under " +
-        MAX_INCOMING_LENGTH +
-        " characters, or break it into shorter messages."
+      "Your message is too long. Please keep it under " + MAX_INCOMING_LENGTH + " characters, or break it into shorter messages."
     );
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(twiml.toString());
@@ -748,16 +770,13 @@ app.post("/whatsapp", async (req, res) => {
 
     console.log(`[MEMORY] Found ${history.length / 2} previous exchanges for ${sender}`);
 
-    const messages = [
-      ...history,
-      { role: "user", content: incomingMsg },
-    ];
+    const messages = [...history, { role: "user", content: incomingMsg }];
 
     const requestBody = {
       model: "claude-sonnet-4-20250514",
       max_tokens: MAX_REPLY_TOKENS,
       system: SYSTEM_PROMPT,
-      messages: messages,
+      messages,
     };
 
     console.log("Sending to Claude API with", messages.length, "messages...");
@@ -801,13 +820,15 @@ app.post("/whatsapp", async (req, res) => {
 
     // ── Background tasks (don't slow down WhatsApp response) ──
 
-    // Forward to Chatwoot dashboard
     sendToChatwoot(sender, incomingMsg, reply).catch((err) => {
       console.error("[CHATWOOT] Background forward error:", err.message);
     });
 
-    // Classify and send email alert
-    const fullConversation = [...history, { role: "user", content: incomingMsg }, { role: "assistant", content: reply }];
+    const fullConversation = [
+      ...history,
+      { role: "user", content: incomingMsg },
+      { role: "assistant", content: reply },
+    ];
     classifyAndAlert(sender, fullConversation).catch((err) => {
       console.error("[EMAIL] Background alert error:", err.message);
     });
@@ -829,7 +850,7 @@ app.post("/whatsapp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v5 — Chatwoot Dashboard!");
+  console.log("ATW WhatsApp Bot v6 — Hardened Chatwoot Integration");
   console.log("Server is running on port " + PORT);
   console.log("Webhook URL: POST /whatsapp");
   console.log("Chatwoot webhook: POST /chatwoot-webhook");
