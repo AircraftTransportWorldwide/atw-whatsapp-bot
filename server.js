@@ -798,6 +798,21 @@ app.post("/whatsapp", async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/xml" });
     res.end(twiml.toString());
     console.log("Reply sent successfully.");
+    
+    // Send reply directly through Twilio as well (ensures WhatsApp delivery)
+if (twilioClient) {
+  try {
+    await twilioClient.messages.create({
+      body: reply,
+      from: TWILIO_WHATSAPP_NUMBER,
+      to: sender,
+    });
+
+    console.log(`[TWILIO] Direct WhatsApp message sent to ${sender}`);
+  } catch (err) {
+    console.error("[TWILIO] Direct send error:", err.message);
+  }
+}
 
     // ── Background tasks (don't slow down WhatsApp response) ──
 
