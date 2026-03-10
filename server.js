@@ -612,7 +612,7 @@ app.post("/chatwoot-webhook", async (req, res) => {
     const whatsappPhone = phone.startsWith("whatsapp:") ? phone : `whatsapp:${phone}`;
     const msgContent    = String(content).trim();
 
-    console.log(`[CHATWOOT-WEBHOOK] Agent message for ${whatsappPhone}: "${msgContent.slice(0, 80)}"`);
+    console.log(`[CHATWOOT-WEBHOOK] Full payload: ${JSON.stringify(payload, null, 2)}`);
 
     // Handle #takeover command
     if (msgContent.toLowerCase() === "#takeover") {
