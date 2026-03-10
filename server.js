@@ -21,11 +21,11 @@ const CLAUDE_API_KEY         = process.env.CLAUDE_API_KEY;
 const RESEND_API_KEY         = process.env.RESEND_API_KEY;
 const TWILIO_ACCOUNT_SID     = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN      = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER; // whatsapp:+18338952590
-const CHATWOOT_API_URL       = process.env.CHATWOOT_API_URL;       // https://chatwoot-production-2de7.up.railway.app
+const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER;
+const CHATWOOT_API_URL       = process.env.CHATWOOT_API_URL;
 const CHATWOOT_API_TOKEN     = process.env.CHATWOOT_API_TOKEN;
-const CHATWOOT_ACCOUNT_ID    = process.env.CHATWOOT_ACCOUNT_ID;    // 1
-const CHATWOOT_INBOX_ID      = process.env.CHATWOOT_INBOX_ID;      // 3
+const CHATWOOT_ACCOUNT_ID    = process.env.CHATWOOT_ACCOUNT_ID;
+const CHATWOOT_INBOX_ID      = process.env.CHATWOOT_INBOX_ID;
 
 const missing = [];
 if (!CLAUDE_API_KEY)         missing.push("CLAUDE_API_KEY");
@@ -145,7 +145,7 @@ Rules:
 // ============================================================
 
 const MAX_HISTORY_PAIRS    = 10;
-const CONVERSATION_TIMEOUT = 60 * 60 * 1000; // 1 hour
+const CONVERSATION_TIMEOUT = 60 * 60 * 1000;
 const conversationHistory  = new Map();
 
 function getHistory(phone) {
@@ -202,8 +202,8 @@ const MAX_REPLY_TOKENS    = 400;
 // AGENT TAKEOVER STATE
 // ============================================================
 
-const AGENT_RESUME_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
-const agentTakeover        = new Map(); // phone → { takenOver: bool, lastAgentReply: timestamp }
+const AGENT_RESUME_TIMEOUT = 2 * 60 * 60 * 1000;
+const agentTakeover        = new Map();
 
 function isAgentActive(phone) {
   const state = agentTakeover.get(phone);
@@ -238,29 +238,8 @@ function releaseAgentTakeover(phone) {
 // CHATWOOT HELPERS
 // ============================================================
 
-// Find existing Chatwoot conversation by phone number
-async function findChatwootConversation(phone) {
-  try {
-    const clean = phone.replace("whatsapp:", "").replace("+", "");
-    const url = `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations?page=1`;
-    const res = await fetch(url, {
-      headers: { "api_access_token": CHATWOOT_API_TOKEN }
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const convos = data?.data?.payload || [];
-    const match = convos.find(c =>
-      c.meta?.sender?.phone_number?.replace("+", "").includes(clean) ||
-      c.meta?.sender?.identifier?.replace("+", "").includes(clean)
-    );
-    return match ? match.id : null;
-  } catch (err) {
-    console.error("[CHATWOOT] findConversation error:", err.message);
-    return null;
-  }
-}
+const chatwootConvMap = new Map();
 
-// Create a new Chatwoot contact
 async function findOrCreateContact(phone) {
   try {
     const clean = phone.replace("whatsapp:", "");
@@ -273,16 +252,11 @@ async function findOrCreateContact(phone) {
       const existing = searchData?.payload?.[0];
       if (existing) return existing.id;
     }
-
-    // Create new contact
     const createRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "api_access_token": CHATWOOT_API_TOKEN,
-        },
+        headers: { "Content-Type": "application/json", "api_access_token": CHATWOOT_API_TOKEN },
         body: JSON.stringify({ phone_number: clean, name: clean }),
       }
     );
@@ -295,17 +269,13 @@ async function findOrCreateContact(phone) {
   }
 }
 
-// Create a new Chatwoot conversation
 async function createChatwootConversation(contactId, phone) {
   try {
     const res = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "api_access_token": CHATWOOT_API_TOKEN,
-        },
+        headers: { "Content-Type": "application/json", "api_access_token": CHATWOOT_API_TOKEN },
         body: JSON.stringify({
           inbox_id: parseInt(CHATWOOT_INBOX_ID),
           contact_id: contactId,
@@ -313,11 +283,7 @@ async function createChatwootConversation(contactId, phone) {
         }),
       }
     );
-    if (!res.ok) {
-      const err = await res.text();
-      console.error("[CHATWOOT] createConversation error:", res.status, err);
-      return null;
-    }
+    if (!res.ok) { const err = await res.text(); console.error("[CHATWOOT] createConversation error:", res.status, err); return null; }
     const data = await res.json();
     console.log(`[CHATWOOT] Created conversation ${data.id} for ${phone}`);
     return data.id;
@@ -327,17 +293,22 @@ async function createChatwootConversation(contactId, phone) {
   }
 }
 
-// Post a message into a Chatwoot conversation (mirror only — does NOT send to WhatsApp)
+async function getOrCreateChatwootConv(phone) {
+  if (chatwootConvMap.has(phone)) return chatwootConvMap.get(phone);
+  const contactId = await findOrCreateContact(phone);
+  if (!contactId) return null;
+  const convId = await createChatwootConversation(contactId, phone);
+  if (convId) chatwootConvMap.set(phone, convId);
+  return convId;
+}
+
 async function mirrorToChatwoot(chatwootConvId, content, isBot) {
   try {
     const res = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${chatwootConvId}/messages`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "api_access_token": CHATWOOT_API_TOKEN,
-        },
+        headers: { "Content-Type": "application/json", "api_access_token": CHATWOOT_API_TOKEN },
         body: JSON.stringify({
           content,
           message_type: isBot ? "outgoing" : "incoming",
@@ -354,20 +325,6 @@ async function mirrorToChatwoot(chatwootConvId, content, isBot) {
   } catch (err) {
     console.error("[CHATWOOT] mirrorToChatwoot error:", err.message);
   }
-}
-
-// In-memory map of phone → Chatwoot conversation ID
-const chatwootConvMap = new Map();
-
-async function getOrCreateChatwootConv(phone) {
-  if (chatwootConvMap.has(phone)) return chatwootConvMap.get(phone);
-  let convId = await findChatwootConversation(phone);
-  if (!convId) {
-    const contactId = await findOrCreateContact(phone);
-    if (contactId) convId = await createChatwootConversation(contactId, phone);
-  }
-  if (convId) chatwootConvMap.set(phone, convId);
-  return convId;
 }
 
 // ============================================================
@@ -498,14 +455,12 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[WEBHOOK] Message from ${from}: "${String(content).slice(0, 80)}"`);
 
-    // Rate limiting
     if (isRateLimited(from)) {
       console.warn(`[WEBHOOK] Rate limited: ${from}`);
       await sendWhatsAppReply(from, "You are sending messages too quickly. Please wait a few minutes and try again.");
       return;
     }
 
-    // Message length guard
     if (String(content).length > MAX_INCOMING_LENGTH) {
       await sendWhatsAppReply(from, `Please keep your message under ${MAX_INCOMING_LENGTH} characters.`);
       return;
@@ -523,12 +478,10 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // Build messages with history
     const history  = getHistory(from);
     console.log(`[MEMORY] ${history.length / 2} previous exchanges for ${from}`);
     const messages = [...history, { role: "user", content: String(content) }];
 
-    // Call Claude
     console.log("[CLAUDE] Calling API...");
     const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -563,15 +516,12 @@ app.post("/webhook", async (req, res) => {
     messages.push({ role: "assistant", content: reply });
     saveHistory(from, messages);
 
-    // Send reply to customer via Twilio
     await sendWhatsAppReply(from, reply);
 
-    // Mirror bot reply to Chatwoot
     if (chatwootConvId) {
       await mirrorToChatwoot(chatwootConvId, reply, true);
     }
 
-    // Classify and email alert in background
     classifyAndAlert(from, messages).catch(err => {
       console.error("[EMAIL] Background error:", err.message);
     });
@@ -593,17 +543,17 @@ app.post("/chatwoot-webhook", async (req, res) => {
     const event      = payload.event;
     const msgType    = payload.message_type;
     const content    = payload.content;
-    const senderType = payload.sender?.type; // "agent" or "contact"
+    const senderType = payload.sender?.type;
 
-    if (event !== "message_created") return;
-    if (msgType !== "outgoing") return;
-    if (senderType !== "agent_bot" && senderType !== "agent") {
-      // Only process actual agent messages
-      if (senderType !== "agent") return;
-    }
-    if (!content || String(content).trim() === "") return;
+    // Log everything before any filtering
+    console.log(`[CHATWOOT-WEBHOOK] Received — event=${event} msgType=${msgType} senderType=${senderType} content="${String(content || "").slice(0, 80)}"`);
+    console.log(`[CHATWOOT-WEBHOOK] Full payload: ${JSON.stringify(payload, null, 2)}`);
 
-    // Get the customer phone from the conversation metadata
+    if (event !== "message_created") { console.log("[CHATWOOT-WEBHOOK] Ignored — not message_created"); return; }
+    if (msgType !== "outgoing") { console.log("[CHATWOOT-WEBHOOK] Ignored — not outgoing"); return; }
+    if (senderType !== "agent") { console.log(`[CHATWOOT-WEBHOOK] Ignored — senderType is "${senderType}", not agent`); return; }
+    if (!content || String(content).trim() === "") { console.log("[CHATWOOT-WEBHOOK] Ignored — empty content"); return; }
+
     const phone = payload.conversation?.meta?.sender?.phone_number
                || payload.meta?.sender?.phone_number;
 
@@ -612,31 +562,25 @@ app.post("/chatwoot-webhook", async (req, res) => {
     const whatsappPhone = phone.startsWith("whatsapp:") ? phone : `whatsapp:${phone}`;
     const msgContent    = String(content).trim();
 
-    console.log(`[CHATWOOT-WEBHOOK] Full payload: ${JSON.stringify(payload, null, 2)}`);
+    console.log(`[CHATWOOT-WEBHOOK] Agent message for ${whatsappPhone}: "${msgContent.slice(0, 80)}"`);
 
-    // Handle #takeover command
     if (msgContent.toLowerCase() === "#takeover") {
       setAgentTakeover(whatsappPhone);
-      console.log(`[TAKEOVER] Agent triggered takeover for ${whatsappPhone}`);
-      return; // Don't forward the command to the customer
-    }
-
-    // Handle #done command
-    if (msgContent.toLowerCase() === "#done") {
-      releaseAgentTakeover(whatsappPhone);
-      console.log(`[TAKEOVER] Agent released conversation for ${whatsappPhone}`);
       return;
     }
 
-    // If agent is active, forward their message to the customer via Twilio
+    if (msgContent.toLowerCase() === "#done") {
+      releaseAgentTakeover(whatsappPhone);
+      return;
+    }
+
     if (isAgentActive(whatsappPhone)) {
       updateAgentActivity(whatsappPhone);
       await sendWhatsAppReply(whatsappPhone, msgContent);
       return;
     }
 
-    // If no takeover active, agent must type #takeover first
-    console.log(`[CHATWOOT-WEBHOOK] Agent replied without #takeover — ignoring. Agent should type #takeover first.`);
+    console.log(`[CHATWOOT-WEBHOOK] Agent replied without #takeover — ignoring.`);
 
   } catch (err) {
     console.error("[CHATWOOT-WEBHOOK] Unhandled error:", err.message, err.stack);
