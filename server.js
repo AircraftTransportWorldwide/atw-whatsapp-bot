@@ -1,15 +1,6 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v8)
+// ATW WhatsApp Bot — server.js (v8.1)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
-// ============================================================
-// Architecture:
-//   WhatsApp → Twilio → Chatwoot → this bot → Claude
-//   Claude reply → Chatwoot API → Twilio → WhatsApp
-//
-// Chatwoot owns the WhatsApp channel natively.
-// This bot plugs in as an agent bot via Chatwoot webhooks.
-// Agent replies go directly through Chatwoot — no Twilio calls
-// needed from this bot at all.
 // ============================================================
 
 import express from "express";
@@ -28,7 +19,6 @@ const CHATWOOT_API_TOKEN   = process.env.CHATWOOT_API_TOKEN;
 const CHATWOOT_ACCOUNT_ID  = process.env.CHATWOOT_ACCOUNT_ID;
 const CHATWOOT_INBOX_ID    = process.env.CHATWOOT_INBOX_ID;
 
-// Validate required vars
 const missing = [];
 if (!CLAUDE_API_KEY)      missing.push("CLAUDE_API_KEY");
 if (!CHATWOOT_API_URL)    missing.push("CHATWOOT_API_URL");
@@ -55,7 +45,6 @@ if (!resend) console.warn("WARNING: RESEND_API_KEY not set. Email alerts disable
 
 const ALERT_RECIPIENTS = [
   "digital@atwcargo.com",
-  // Uncomment once Resend domain verified:
   // "laura@atwcargo.com",
   // "billing@diamondaircraft.us",
 ];
@@ -141,13 +130,12 @@ Rules:
 // ============================================================
 
 const MAX_HISTORY_PAIRS    = 10;
-const CONVERSATION_TIMEOUT = 60 * 60 * 1000; // 1 hour
+const CONVERSATION_TIMEOUT = 60 * 60 * 1000;
 const conversationHistory  = new Map();
 
 function getHistory(conversationId) {
   const convo = conversationHistory.get(conversationId);
   if (!convo) return [];
-
   if (Date.now() - convo.lastActivity > CONVERSATION_TIMEOUT) {
     console.log(`[MEMORY] Expired conversation ${conversationId}`);
     conversationHistory.delete(conversationId);
@@ -157,19 +145,14 @@ function getHistory(conversationId) {
 }
 
 function saveHistory(conversationId, messages) {
-  // Trim to max pairs
   while (messages.length > MAX_HISTORY_PAIRS * 2) {
     messages.shift();
     messages.shift();
   }
-  conversationHistory.set(conversationId, {
-    messages,
-    lastActivity: Date.now(),
-  });
+  conversationHistory.set(conversationId, { messages, lastActivity: Date.now() });
   console.log(`[MEMORY] Saved ${messages.length / 2} exchanges for conversation ${conversationId}`);
 }
 
-// Cleanup every 30 min
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
@@ -191,8 +174,8 @@ const RATE_LIMIT_WINDOW = 10 * 60 * 1000;
 const rateLimitMap      = new Map();
 
 function isRateLimited(id) {
-  const now = Date.now();
-  const ts  = rateLimitMap.get(id) || [];
+  const now    = Date.now();
+  const ts     = rateLimitMap.get(id) || [];
   const recent = ts.filter(t => now - t < RATE_LIMIT_WINDOW);
   if (recent.length >= RATE_LIMIT_MAX) return true;
   recent.push(now);
@@ -228,7 +211,7 @@ async function sendChatwootMessage(conversationId, content) {
     throw new Error(`Chatwoot API error ${res.status}: ${err}`);
   }
 
-  console.log(`[CHATWOOT] ✅ Reply sent to conversation ${conversationId}`);
+  console.log(`[CHATWOOT] Reply sent to conversation ${conversationId}`);
   return await res.json();
 }
 
@@ -250,7 +233,6 @@ function hasRecentAlert(id, tier) {
 
 async function classifyAndAlert(conversationId, messages, phoneDisplay) {
   if (!resend) return;
-
   try {
     const transcript = messages
       .map(m => `${m.role === "user" ? "CLIENT" : "ATW BOT"}: ${m.content}`)
@@ -272,10 +254,7 @@ async function classifyAndAlert(conversationId, messages, phoneDisplay) {
     });
 
     const data = await res.json();
-    if (!res.ok) {
-      console.error("[EMAIL] Classification error:", JSON.stringify(data));
-      return;
-    }
+    if (!res.ok) { console.error("[EMAIL] Classification error:", JSON.stringify(data)); return; }
 
     const rawText = data?.content?.[0]?.text || "";
     let classification;
@@ -288,18 +267,11 @@ async function classifyAndAlert(conversationId, messages, phoneDisplay) {
 
     const { tier, summary = "No summary", origin = "TBD", destination = "TBD", urgency = "UNKNOWN" } = classification;
     console.log(`[EMAIL] Tier ${tier} | ${origin} → ${destination} | ${urgency}`);
-
     if (tier === 3) return;
-    if (hasRecentAlert(conversationId, tier)) {
-      console.log(`[EMAIL] Cooldown active, skipping.`);
-      return;
-    }
+    if (hasRecentAlert(conversationId, tier)) { console.log(`[EMAIL] Cooldown active, skipping.`); return; }
 
-    const subject = tier === 1
-      ? `🚨 AOG ALERT — ${origin} → ${destination} — ${phoneDisplay}`
-      : `📦 New Shipment Inquiry — ${origin} → ${destination} — ${phoneDisplay}`;
-
-    const tierLabel = tier === 1 ? "🚨 TIER 1 — AOG EMERGENCY" : "📦 TIER 2 — STANDARD INQUIRY";
+    const subject   = tier === 1 ? `AOG ALERT — ${origin} → ${destination} — ${phoneDisplay}` : `New Shipment Inquiry — ${origin} → ${destination} — ${phoneDisplay}`;
+    const tierLabel = tier === 1 ? "TIER 1 — AOG EMERGENCY" : "TIER 2 — STANDARD INQUIRY";
     const tierColor = tier === 1 ? "#dc2626" : "#2563eb";
 
     const transcriptHtml = messages.map(m => {
@@ -327,12 +299,12 @@ async function classifyAndAlert(conversationId, messages, phoneDisplay) {
           <div style="background:#f1f5f9;padding:16px;border-radius:8px;font-size:14px;">${transcriptHtml}</div>
         </div>
         <p style="color:#94a3b8;font-size:12px;text-align:center;margin-top:16px;">
-          ATW WhatsApp Bot v8 — ${new Date().toISOString()}
+          ATW WhatsApp Bot v8.1 — ${new Date().toISOString()}
         </p>
       </div>`;
 
     await resend.emails.send({ from: ALERT_FROM_EMAIL, to: ALERT_RECIPIENTS, subject, html: emailHtml });
-    console.log(`[EMAIL] ✅ Tier ${tier} alert sent.`);
+    console.log(`[EMAIL] Tier ${tier} alert sent.`);
     alertsSent.set(conversationId, { tier, timestamp: Date.now() });
 
   } catch (err) {
@@ -341,61 +313,67 @@ async function classifyAndAlert(conversationId, messages, phoneDisplay) {
 }
 
 // ============================================================
-// CHATWOOT WEBHOOK — receives all messages
-// ============================================================
-// Chatwoot calls this endpoint whenever a message is created.
-// We only act on incoming messages (from customer).
-// Agent messages are handled by Chatwoot natively.
+// CHATWOOT WEBHOOK
 // ============================================================
 
 app.post("/chatwoot-webhook", async (req, res) => {
-  // Always respond 200 immediately so Chatwoot doesn't retry
   res.status(200).send("ok");
 
   try {
     const payload = req.body;
 
-    console.log("[WEBHOOK] Event:", payload.event, "| Type:", payload.message_type);
+    // ── DEBUG: log full payload so we can see exact structure ──
+    console.log("[WEBHOOK] Full payload:", JSON.stringify(payload, null, 2));
 
-    // Only process new incoming messages from customers
-    if (payload.event !== "message_created") return;
-    if (payload.message_type !== "incoming") return;
+    // Extract event — Chatwoot may use different field names
+    const event       = payload.event       || payload.type;
+    const msgType     = payload.message_type || payload.messageType;
+    const content     = payload.content      || payload.body;
 
-    // Ignore if no content
-    const content = payload.content;
-    if (!content || content.trim() === "") return;
+    console.log(`[WEBHOOK] Event: ${event} | Type: ${msgType} | Content: ${String(content).slice(0, 80)}`);
 
-    const conversationId = payload.conversation?.id;
-    const contactPhone   = payload.conversation?.meta?.sender?.phone_number
-                        || payload.meta?.sender?.phone_number
-                        || "Unknown";
+    // Only process new incoming customer messages
+    if (event !== "message_created") return;
+    if (msgType !== "incoming") return;
+    if (!content || String(content).trim() === "") return;
+
+    // Extract conversation ID — check multiple possible locations
+    const conversationId = payload.conversation?.id
+                        || payload.id;
+
+    // Extract phone number — check multiple possible locations
+    const contactPhone = payload.conversation?.meta?.sender?.phone_number
+                      || payload.meta?.sender?.phone_number
+                      || payload.conversation?.meta?.sender?.identifier
+                      || payload.contact?.phone_number
+                      || "Unknown";
 
     if (!conversationId) {
-      console.error("[WEBHOOK] No conversation ID in payload");
+      console.error("[WEBHOOK] No conversation ID found in payload");
       return;
     }
 
-    console.log(`[WEBHOOK] Message from ${contactPhone} in conversation ${conversationId}: "${content.slice(0, 80)}"`);
+    console.log(`[WEBHOOK] Message from ${contactPhone} in conversation ${conversationId}: "${String(content).slice(0, 80)}"`);
 
-    // Rate limiting by conversation ID
+    // Rate limiting
     if (isRateLimited(conversationId)) {
       console.warn(`[WEBHOOK] Rate limited conversation ${conversationId}`);
-      await sendChatwootMessage(conversationId, "You're sending messages too quickly. Please wait a few minutes and try again.");
+      await sendChatwootMessage(conversationId, "You are sending messages too quickly. Please wait a few minutes and try again.");
       return;
     }
 
     // Message length check
-    if (content.length > MAX_INCOMING_LENGTH) {
+    if (String(content).length > MAX_INCOMING_LENGTH) {
       console.warn(`[WEBHOOK] Message too long in conversation ${conversationId}`);
       await sendChatwootMessage(conversationId, `Your message is too long. Please keep it under ${MAX_INCOMING_LENGTH} characters.`);
       return;
     }
 
     // Get conversation history
-    const history = getHistory(conversationId);
+    const history  = getHistory(conversationId);
     console.log(`[MEMORY] ${history.length / 2} previous exchanges for conversation ${conversationId}`);
 
-    const messages = [...history, { role: "user", content }];
+    const messages = [...history, { role: "user", content: String(content) }];
 
     // Call Claude
     const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -428,35 +406,32 @@ app.post("/chatwoot-webhook", async (req, res) => {
       return;
     }
 
-    console.log(`[CLAUDE] Reply: "${reply.slice(0, 120)}..."`);
+    console.log(`[CLAUDE] Reply: "${reply.slice(0, 120)}"`);
 
-    // Save to memory
     messages.push({ role: "assistant", content: reply });
     saveHistory(conversationId, messages);
 
-    // Send reply via Chatwoot (Chatwoot forwards to Twilio → WhatsApp)
     await sendChatwootMessage(conversationId, reply);
 
-    // Background: classify and email alert
     classifyAndAlert(conversationId, messages, contactPhone).catch(err => {
       console.error("[EMAIL] Background error:", err.message);
     });
 
   } catch (err) {
-    console.error("[WEBHOOK] Unhandled error:", err.message);
+    console.error("[WEBHOOK] Unhandled error:", err.message, err.stack);
   }
 });
 
 // ── Health check ───────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send(`ATW WhatsApp Bot v8 running. Active conversations: ${conversationHistory.size}`);
+  res.send(`ATW WhatsApp Bot v8.1 running. Active conversations: ${conversationHistory.size}`);
 });
 
 // ── Start server ───────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v8 — Chatwoot Native");
+  console.log("ATW WhatsApp Bot v8.1 — Chatwoot Native");
   console.log("Server running on port " + PORT);
   console.log("Chatwoot webhook: POST /chatwoot-webhook");
   console.log("Rate limit: " + RATE_LIMIT_MAX + " msgs per " + (RATE_LIMIT_WINDOW / 60000) + " min");
