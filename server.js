@@ -1,7 +1,10 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v9.0)
+// ATW WhatsApp Bot — server.js (v10.0)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // Architecture: Twilio → Bot → Claude → Twilio → WhatsApp
+//               Bot mirrors all messages to Chatwoot
+//               Agents can take over via #takeover in Chatwoot
+//               Bot auto-resumes after 2 hours of agent silence
 // ============================================================
 
 import express from "express";
@@ -14,26 +17,35 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ── Environment Variables ──────────────────────────────────────
-const CLAUDE_API_KEY        = process.env.CLAUDE_API_KEY;
-const RESEND_API_KEY        = process.env.RESEND_API_KEY;
-const TWILIO_ACCOUNT_SID    = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN     = process.env.TWILIO_AUTH_TOKEN;
+const CLAUDE_API_KEY         = process.env.CLAUDE_API_KEY;
+const RESEND_API_KEY         = process.env.RESEND_API_KEY;
+const TWILIO_ACCOUNT_SID     = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN      = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER; // whatsapp:+18338952590
+const CHATWOOT_API_URL       = process.env.CHATWOOT_API_URL;       // https://chatwoot-production-2de7.up.railway.app
+const CHATWOOT_API_TOKEN     = process.env.CHATWOOT_API_TOKEN;
+const CHATWOOT_ACCOUNT_ID    = process.env.CHATWOOT_ACCOUNT_ID;    // 1
+const CHATWOOT_INBOX_ID      = process.env.CHATWOOT_INBOX_ID;      // 3
 
 const missing = [];
-if (!CLAUDE_API_KEY)           missing.push("CLAUDE_API_KEY");
-if (!TWILIO_ACCOUNT_SID)       missing.push("TWILIO_ACCOUNT_SID");
-if (!TWILIO_AUTH_TOKEN)        missing.push("TWILIO_AUTH_TOKEN");
-if (!TWILIO_WHATSAPP_NUMBER)   missing.push("TWILIO_WHATSAPP_NUMBER");
+if (!CLAUDE_API_KEY)         missing.push("CLAUDE_API_KEY");
+if (!TWILIO_ACCOUNT_SID)     missing.push("TWILIO_ACCOUNT_SID");
+if (!TWILIO_AUTH_TOKEN)      missing.push("TWILIO_AUTH_TOKEN");
+if (!TWILIO_WHATSAPP_NUMBER) missing.push("TWILIO_WHATSAPP_NUMBER");
+if (!CHATWOOT_API_URL)       missing.push("CHATWOOT_API_URL");
+if (!CHATWOOT_API_TOKEN)     missing.push("CHATWOOT_API_TOKEN");
+if (!CHATWOOT_ACCOUNT_ID)    missing.push("CHATWOOT_ACCOUNT_ID");
+if (!CHATWOOT_INBOX_ID)      missing.push("CHATWOOT_INBOX_ID");
 
 if (missing.length > 0) {
   console.error("FATAL: Missing environment variables:", missing.join(", "));
 } else {
   console.log("All required environment variables loaded.");
   console.log("Twilio number:", TWILIO_WHATSAPP_NUMBER);
+  console.log("Chatwoot URL:", CHATWOOT_API_URL);
 }
 
-// ── Twilio & Resend Clients ────────────────────────────────────
+// ── Clients ────────────────────────────────────────────────────
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 if (!resend) console.warn("WARNING: RESEND_API_KEY not set. Email alerts disabled.");
@@ -61,8 +73,11 @@ YOUR ROLE:
 - You understand that AOG situations are TIME-CRITICAL — every minute an aircraft is grounded costs the airline thousands of dollars
 - You collect key shipment details from clients so the ATW team can act fast
 
+GREETING RULE:
+- On first message, greet with a single warm short sentence only. Example: "Hi, I'm Patty from ATW — how can I help you today?"
+- Never add company descriptions, mission statements, or capability summaries in the opening message
+
 WHAT YOU SHOULD DO:
-- Greet clients professionally but briefly (this is WhatsApp, keep it concise)
 - Ask for essential shipment details if not provided: part number, origin, destination, weight/dimensions, and urgency level
 - Provide general information about ATW's AOG logistics capabilities
 - Give rough transit time estimates based on common routes when possible
@@ -145,14 +160,11 @@ function getHistory(phone) {
 }
 
 function saveHistory(phone, messages) {
-  while (messages.length > MAX_HISTORY_PAIRS * 2) {
-    messages.splice(0, 2); // remove oldest pair
-  }
+  while (messages.length > MAX_HISTORY_PAIRS * 2) messages.splice(0, 2);
   conversationHistory.set(phone, { messages, lastActivity: Date.now() });
   console.log(`[MEMORY] Saved ${messages.length / 2} exchanges for ${phone}`);
 }
 
-// Clean expired conversations every 30 minutes
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
@@ -162,7 +174,7 @@ setInterval(() => {
       cleaned++;
     }
   }
-  if (cleaned > 0) console.log(`[MEMORY] Cleaned ${cleaned} expired conversations. Active: ${conversationHistory.size}`);
+  if (cleaned > 0) console.log(`[MEMORY] Cleaned ${cleaned} expired. Active: ${conversationHistory.size}`);
 }, 30 * 60 * 1000);
 
 // ============================================================
@@ -170,7 +182,7 @@ setInterval(() => {
 // ============================================================
 
 const RATE_LIMIT_MAX    = 15;
-const RATE_LIMIT_WINDOW = 10 * 60 * 1000; // 10 minutes
+const RATE_LIMIT_WINDOW = 10 * 60 * 1000;
 const rateLimitMap      = new Map();
 
 function isRateLimited(phone) {
@@ -185,6 +197,178 @@ function isRateLimited(phone) {
 
 const MAX_INCOMING_LENGTH = 1000;
 const MAX_REPLY_TOKENS    = 400;
+
+// ============================================================
+// AGENT TAKEOVER STATE
+// ============================================================
+
+const AGENT_RESUME_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+const agentTakeover        = new Map(); // phone → { takenOver: bool, lastAgentReply: timestamp }
+
+function isAgentActive(phone) {
+  const state = agentTakeover.get(phone);
+  if (!state || !state.takenOver) return false;
+  if (Date.now() - state.lastAgentReply > AGENT_RESUME_TIMEOUT) {
+    console.log(`[TAKEOVER] Agent timeout for ${phone} — bot resuming.`);
+    agentTakeover.delete(phone);
+    return false;
+  }
+  return true;
+}
+
+function setAgentTakeover(phone) {
+  agentTakeover.set(phone, { takenOver: true, lastAgentReply: Date.now() });
+  console.log(`[TAKEOVER] Agent took over conversation for ${phone}`);
+}
+
+function updateAgentActivity(phone) {
+  const state = agentTakeover.get(phone);
+  if (state) {
+    state.lastAgentReply = Date.now();
+    agentTakeover.set(phone, state);
+  }
+}
+
+function releaseAgentTakeover(phone) {
+  agentTakeover.delete(phone);
+  console.log(`[TAKEOVER] Bot resumed for ${phone}`);
+}
+
+// ============================================================
+// CHATWOOT HELPERS
+// ============================================================
+
+// Find existing Chatwoot conversation by phone number
+async function findChatwootConversation(phone) {
+  try {
+    const clean = phone.replace("whatsapp:", "").replace("+", "");
+    const url = `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations?page=1`;
+    const res = await fetch(url, {
+      headers: { "api_access_token": CHATWOOT_API_TOKEN }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const convos = data?.data?.payload || [];
+    const match = convos.find(c =>
+      c.meta?.sender?.phone_number?.replace("+", "").includes(clean) ||
+      c.meta?.sender?.identifier?.replace("+", "").includes(clean)
+    );
+    return match ? match.id : null;
+  } catch (err) {
+    console.error("[CHATWOOT] findConversation error:", err.message);
+    return null;
+  }
+}
+
+// Create a new Chatwoot contact
+async function findOrCreateContact(phone) {
+  try {
+    const clean = phone.replace("whatsapp:", "");
+    const searchRes = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${encodeURIComponent(clean)}&page=1`,
+      { headers: { "api_access_token": CHATWOOT_API_TOKEN } }
+    );
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      const existing = searchData?.payload?.[0];
+      if (existing) return existing.id;
+    }
+
+    // Create new contact
+    const createRes = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api_access_token": CHATWOOT_API_TOKEN,
+        },
+        body: JSON.stringify({ phone_number: clean, name: clean }),
+      }
+    );
+    if (!createRes.ok) return null;
+    const created = await createRes.json();
+    return created?.id || null;
+  } catch (err) {
+    console.error("[CHATWOOT] findOrCreateContact error:", err.message);
+    return null;
+  }
+}
+
+// Create a new Chatwoot conversation
+async function createChatwootConversation(contactId, phone) {
+  try {
+    const res = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api_access_token": CHATWOOT_API_TOKEN,
+        },
+        body: JSON.stringify({
+          inbox_id: parseInt(CHATWOOT_INBOX_ID),
+          contact_id: contactId,
+          additional_attributes: { phone },
+        }),
+      }
+    );
+    if (!res.ok) {
+      const err = await res.text();
+      console.error("[CHATWOOT] createConversation error:", res.status, err);
+      return null;
+    }
+    const data = await res.json();
+    console.log(`[CHATWOOT] Created conversation ${data.id} for ${phone}`);
+    return data.id;
+  } catch (err) {
+    console.error("[CHATWOOT] createConversation error:", err.message);
+    return null;
+  }
+}
+
+// Post a message into a Chatwoot conversation (mirror only — does NOT send to WhatsApp)
+async function mirrorToChatwoot(chatwootConvId, content, isBot) {
+  try {
+    const res = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${chatwootConvId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "api_access_token": CHATWOOT_API_TOKEN,
+        },
+        body: JSON.stringify({
+          content,
+          message_type: isBot ? "outgoing" : "incoming",
+          private: false,
+        }),
+      }
+    );
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[CHATWOOT] mirrorToChatwoot error ${res.status}:`, err);
+    } else {
+      console.log(`[CHATWOOT] Mirrored ${isBot ? "bot" : "customer"} message to conversation ${chatwootConvId}`);
+    }
+  } catch (err) {
+    console.error("[CHATWOOT] mirrorToChatwoot error:", err.message);
+  }
+}
+
+// In-memory map of phone → Chatwoot conversation ID
+const chatwootConvMap = new Map();
+
+async function getOrCreateChatwootConv(phone) {
+  if (chatwootConvMap.has(phone)) return chatwootConvMap.get(phone);
+  let convId = await findChatwootConversation(phone);
+  if (!convId) {
+    const contactId = await findOrCreateContact(phone);
+    if (contactId) convId = await createChatwootConversation(contactId, phone);
+  }
+  if (convId) chatwootConvMap.set(phone, convId);
+  return convId;
+}
 
 // ============================================================
 // TWILIO REPLY HELPER
@@ -208,15 +392,13 @@ async function sendWhatsAppReply(to, body) {
 // ============================================================
 
 const alertsSent     = new Map();
-const ALERT_COOLDOWN = 30 * 60 * 1000; // 30 minutes
+const ALERT_COOLDOWN = 30 * 60 * 1000;
 
 function hasRecentAlert(phone, tier) {
   const prev = alertsSent.get(phone);
   if (!prev) return false;
-  const now = Date.now();
-  // Always allow tier 1 to override a previous tier 2
   if (tier === 1 && prev.tier === 2) return false;
-  if (prev.tier === tier && now - prev.timestamp < ALERT_COOLDOWN) return true;
+  if (prev.tier === tier && Date.now() - prev.timestamp < ALERT_COOLDOWN) return true;
   return false;
 }
 
@@ -243,22 +425,17 @@ async function classifyAndAlert(phone, messages) {
     });
 
     const data = await res.json();
-    if (!res.ok) { console.error("[EMAIL] Classification API error:", JSON.stringify(data)); return; }
+    if (!res.ok) { console.error("[EMAIL] Classification error:", JSON.stringify(data)); return; }
 
     const rawText = data?.content?.[0]?.text || "";
-    let classification;
-    try {
-      classification = JSON.parse(rawText.replace(/```json|```/g, "").trim());
-    } catch {
-      console.error("[EMAIL] Failed to parse classification JSON:", rawText);
-      return;
-    }
+    let cl;
+    try { cl = JSON.parse(rawText.replace(/```json|```/g, "").trim()); }
+    catch { console.error("[EMAIL] Failed to parse classification:", rawText); return; }
 
-    const { tier, summary = "No summary", origin = "TBD", destination = "TBD", urgency = "UNKNOWN" } = classification;
-    console.log(`[EMAIL] Classified Tier ${tier} | ${origin} → ${destination} | ${urgency}`);
-
-    if (tier === 3) { console.log("[EMAIL] Tier 3 — no email needed."); return; }
-    if (hasRecentAlert(phone, tier)) { console.log("[EMAIL] Cooldown active, skipping alert."); return; }
+    const { tier, summary = "No summary", origin = "TBD", destination = "TBD", urgency = "UNKNOWN" } = cl;
+    console.log(`[EMAIL] Tier ${tier} | ${origin} → ${destination} | ${urgency}`);
+    if (tier === 3) return;
+    if (hasRecentAlert(phone, tier)) { console.log("[EMAIL] Cooldown active, skipping."); return; }
 
     const phoneDisplay = phone.replace("whatsapp:", "");
     const subject      = tier === 1
@@ -292,12 +469,12 @@ async function classifyAndAlert(phone, messages) {
           <div style="background:#f1f5f9;padding:16px;border-radius:8px;font-size:13px;line-height:1.6;">${transcriptHtml}</div>
         </div>
         <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:16px;">
-          ATW WhatsApp Bot v9.0 — ${new Date().toISOString()}
+          ATW WhatsApp Bot v10.0 — ${new Date().toISOString()}
         </p>
       </div>`;
 
     await resend.emails.send({ from: ALERT_FROM_EMAIL, to: ALERT_RECIPIENTS, subject, html: emailHtml });
-    console.log(`[EMAIL] Tier ${tier} alert sent to: ${ALERT_RECIPIENTS.join(", ")}`);
+    console.log(`[EMAIL] Tier ${tier} alert sent.`);
     alertsSent.set(phone, { tier, timestamp: Date.now() });
 
   } catch (err) {
@@ -306,23 +483,18 @@ async function classifyAndAlert(phone, messages) {
 }
 
 // ============================================================
-// MAIN WEBHOOK — Twilio sends all incoming WhatsApp messages here
+// MAIN WEBHOOK — Incoming WhatsApp messages from Twilio
 // ============================================================
 
 app.post("/webhook", async (req, res) => {
-  // Respond immediately to Twilio with empty TwiML (we reply via API, not TwiML)
   res.set("Content-Type", "text/xml");
   res.send("<Response></Response>");
 
   try {
-    const from    = req.body.From;   // e.g. whatsapp:+12399203265
-    const to      = req.body.To;     // e.g. whatsapp:+18338952590
+    const from    = req.body.From;
     const content = req.body.Body;
 
-    if (!from || !content) {
-      console.warn("[WEBHOOK] Missing From or Body — ignoring.");
-      return;
-    }
+    if (!from || !content) { console.warn("[WEBHOOK] Missing From or Body."); return; }
 
     console.log(`[WEBHOOK] Message from ${from}: "${String(content).slice(0, 80)}"`);
 
@@ -335,12 +507,23 @@ app.post("/webhook", async (req, res) => {
 
     // Message length guard
     if (String(content).length > MAX_INCOMING_LENGTH) {
-      console.warn(`[WEBHOOK] Message too long from ${from}`);
       await sendWhatsAppReply(from, `Please keep your message under ${MAX_INCOMING_LENGTH} characters.`);
       return;
     }
 
-    // Build messages array with history
+    // Mirror customer message to Chatwoot
+    const chatwootConvId = await getOrCreateChatwootConv(from);
+    if (chatwootConvId) {
+      await mirrorToChatwoot(chatwootConvId, String(content), false);
+    }
+
+    // If agent has taken over, stay silent
+    if (isAgentActive(from)) {
+      console.log(`[TAKEOVER] Agent active for ${from} — bot staying silent.`);
+      return;
+    }
+
+    // Build messages with history
     const history  = getHistory(from);
     console.log(`[MEMORY] ${history.length / 2} previous exchanges for ${from}`);
     const messages = [...history, { role: "user", content: String(content) }];
@@ -363,7 +546,6 @@ app.post("/webhook", async (req, res) => {
     });
 
     const claudeData = await claudeRes.json();
-
     if (!claudeRes.ok) {
       console.error("[CLAUDE] API error:", claudeRes.status, JSON.stringify(claudeData));
       await sendWhatsAppReply(from, "ATW system is temporarily unavailable. Please try again shortly.");
@@ -378,15 +560,18 @@ app.post("/webhook", async (req, res) => {
     }
 
     console.log(`[CLAUDE] Reply: "${reply.slice(0, 120)}"`);
-
-    // Save updated history
     messages.push({ role: "assistant", content: reply });
     saveHistory(from, messages);
 
-    // Send reply via Twilio
+    // Send reply to customer via Twilio
     await sendWhatsAppReply(from, reply);
 
-    // Classify and send email alert in background
+    // Mirror bot reply to Chatwoot
+    if (chatwootConvId) {
+      await mirrorToChatwoot(chatwootConvId, reply, true);
+    }
+
+    // Classify and email alert in background
     classifyAndAlert(from, messages).catch(err => {
       console.error("[EMAIL] Background error:", err.message);
     });
@@ -396,22 +581,88 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// ============================================================
+// CHATWOOT WEBHOOK — Agent messages come in here
+// ============================================================
+
+app.post("/chatwoot-webhook", async (req, res) => {
+  res.status(200).send("ok");
+
+  try {
+    const payload    = req.body;
+    const event      = payload.event;
+    const msgType    = payload.message_type;
+    const content    = payload.content;
+    const senderType = payload.sender?.type; // "agent" or "contact"
+
+    if (event !== "message_created") return;
+    if (msgType !== "outgoing") return;
+    if (senderType !== "agent_bot" && senderType !== "agent") {
+      // Only process actual agent messages
+      if (senderType !== "agent") return;
+    }
+    if (!content || String(content).trim() === "") return;
+
+    // Get the customer phone from the conversation metadata
+    const phone = payload.conversation?.meta?.sender?.phone_number
+               || payload.meta?.sender?.phone_number;
+
+    if (!phone) { console.warn("[CHATWOOT-WEBHOOK] No phone found in payload."); return; }
+
+    const whatsappPhone = phone.startsWith("whatsapp:") ? phone : `whatsapp:${phone}`;
+    const msgContent    = String(content).trim();
+
+    console.log(`[CHATWOOT-WEBHOOK] Agent message for ${whatsappPhone}: "${msgContent.slice(0, 80)}"`);
+
+    // Handle #takeover command
+    if (msgContent.toLowerCase() === "#takeover") {
+      setAgentTakeover(whatsappPhone);
+      console.log(`[TAKEOVER] Agent triggered takeover for ${whatsappPhone}`);
+      return; // Don't forward the command to the customer
+    }
+
+    // Handle #done command
+    if (msgContent.toLowerCase() === "#done") {
+      releaseAgentTakeover(whatsappPhone);
+      console.log(`[TAKEOVER] Agent released conversation for ${whatsappPhone}`);
+      return;
+    }
+
+    // If agent is active, forward their message to the customer via Twilio
+    if (isAgentActive(whatsappPhone)) {
+      updateAgentActivity(whatsappPhone);
+      await sendWhatsAppReply(whatsappPhone, msgContent);
+      return;
+    }
+
+    // If no takeover active, agent must type #takeover first
+    console.log(`[CHATWOOT-WEBHOOK] Agent replied without #takeover — ignoring. Agent should type #takeover first.`);
+
+  } catch (err) {
+    console.error("[CHATWOOT-WEBHOOK] Unhandled error:", err.message, err.stack);
+  }
+});
+
 // ── Health check ───────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send(`ATW WhatsApp Bot v9.0 running. Active conversations: ${conversationHistory.size}`);
+  res.send(`ATW WhatsApp Bot v10.0 running. Active conversations: ${conversationHistory.size}. Agent takeovers: ${agentTakeover.size}`);
 });
 
 // ── Start server ───────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v9.0 — Direct Twilio Mode");
+  console.log("ATW WhatsApp Bot v10.0 — Twilio + Chatwoot");
   console.log("Server running on port " + PORT);
-  console.log("Incoming webhook: POST /webhook");
-  console.log("Rate limit: " + RATE_LIMIT_MAX + " msgs per " + (RATE_LIMIT_WINDOW / 60000) + " min");
-  console.log("Max message length: " + MAX_INCOMING_LENGTH + " chars");
-  console.log("Max reply tokens: " + MAX_REPLY_TOKENS);
-  console.log("Memory: last " + MAX_HISTORY_PAIRS + " exchanges, 60 min timeout");
-  console.log("Email alerts: " + (resend ? "ACTIVE" : "DISABLED"));
+  console.log("Incoming webhook:  POST /webhook");
+  console.log("Chatwoot webhook:  POST /chatwoot-webhook");
+  console.log("Agent takeover:    type #takeover in Chatwoot");
+  console.log("Agent release:     type #done in Chatwoot");
+  console.log("Auto-resume:       2 hours after last agent reply");
+  console.log("Rate limit:        " + RATE_LIMIT_MAX + " msgs per " + (RATE_LIMIT_WINDOW / 60000) + " min");
+  console.log("Max message:       " + MAX_INCOMING_LENGTH + " chars");
+  console.log("Max reply tokens:  " + MAX_REPLY_TOKENS);
+  console.log("Memory:            last " + MAX_HISTORY_PAIRS + " exchanges, 60 min timeout");
+  console.log("Email alerts:      " + (resend ? "ACTIVE" : "DISABLED"));
   console.log("============================================");
 });
