@@ -1,5 +1,5 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v10.1)
+// ATW WhatsApp Bot — server.js (v10.2)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // Architecture: Twilio → Bot → Claude → Twilio → WhatsApp
 //               Bot mirrors all messages to Chatwoot
@@ -270,6 +270,28 @@ async function findOrCreateContact(phone) {
   }
 }
 
+// Find existing open conversation for this contact in our inbox
+async function findExistingConversation(contactId) {
+  try {
+    const res = await fetch(
+      `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${contactId}/conversations`,
+      { headers: { "api_access_token": CHATWOOT_API_TOKEN } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const convos = data?.payload || [];
+    // Find open conversation in our inbox
+    const match = convos.find(c =>
+      c.inbox_id === parseInt(CHATWOOT_INBOX_ID) && c.status === "open"
+    );
+    if (match) { console.log(`[CHATWOOT] Found existing conversation ${match.id} for contact ${contactId}`); return match.id; }
+    return null;
+  } catch (err) {
+    console.error("[CHATWOOT] findExistingConversation error:", err.message);
+    return null;
+  }
+}
+
 async function createChatwootConversation(contactId, phone) {
   try {
     const res = await fetch(
@@ -295,10 +317,17 @@ async function createChatwootConversation(contactId, phone) {
 }
 
 async function getOrCreateChatwootConv(phone) {
+  // Check in-memory cache first
   if (chatwootConvMap.has(phone)) return chatwootConvMap.get(phone);
+
+  // Find or create contact
   const contactId = await findOrCreateContact(phone);
   if (!contactId) return null;
-  const convId = await createChatwootConversation(contactId, phone);
+
+  // Look for existing open conversation before creating a new one
+  let convId = await findExistingConversation(contactId);
+  if (!convId) convId = await createChatwootConversation(contactId, phone);
+
   if (convId) chatwootConvMap.set(phone, convId);
   return convId;
 }
@@ -426,7 +455,7 @@ async function classifyAndAlert(phone, messages) {
           <div style="background:#f1f5f9;padding:16px;border-radius:8px;font-size:13px;line-height:1.6;">${transcriptHtml}</div>
         </div>
         <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:16px;">
-          ATW WhatsApp Bot v10.1 — ${new Date().toISOString()}
+          ATW WhatsApp Bot v10.2 — ${new Date().toISOString()}
         </p>
       </div>`;
 
@@ -543,14 +572,15 @@ app.post("/chatwoot-webhook", async (req, res) => {
     const event      = payload.event;
     const msgType    = payload.message_type;
     const content    = payload.content;
-    // Chatwoot sends sender_type at root level, not nested under sender object
+    // Chatwoot uses "user" for human agents in webhook payloads
     const senderType = payload.sender_type || payload.sender?.type;
 
     console.log(`[CHATWOOT-WEBHOOK] Received — event=${event} msgType=${msgType} senderType=${senderType} content="${String(content || "").slice(0, 80)}"`);
 
     if (event !== "message_created") { console.log("[CHATWOOT-WEBHOOK] Ignored — not message_created"); return; }
     if (msgType !== "outgoing") { console.log("[CHATWOOT-WEBHOOK] Ignored — not outgoing"); return; }
-    if (senderType !== "agent") { console.log(`[CHATWOOT-WEBHOOK] Ignored — senderType is "${senderType}", not agent`); return; }
+    // "user" = human agent in Chatwoot's webhook payload
+    if (senderType !== "user") { console.log(`[CHATWOOT-WEBHOOK] Ignored — senderType is "${senderType}", not user/agent`); return; }
     if (!content || String(content).trim() === "") { console.log("[CHATWOOT-WEBHOOK] Ignored — empty content"); return; }
 
     // Phone stored in conversation additional_attributes when we created it
@@ -590,14 +620,14 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
 // ── Health check ───────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send(`ATW WhatsApp Bot v10.1 running. Active conversations: ${conversationHistory.size}. Agent takeovers: ${agentTakeover.size}`);
+  res.send(`ATW WhatsApp Bot v10.2 running. Active conversations: ${conversationHistory.size}. Agent takeovers: ${agentTakeover.size}`);
 });
 
 // ── Start server ───────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v10.1 — Twilio + Chatwoot");
+  console.log("ATW WhatsApp Bot v10.2 — Twilio + Chatwoot");
   console.log("Server running on port " + PORT);
   console.log("Incoming webhook:  POST /webhook");
   console.log("Chatwoot webhook:  POST /chatwoot-webhook");
