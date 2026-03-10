@@ -1,5 +1,5 @@
 // ============================================================
-// ATW WhatsApp Bot — server.js (v10.0)
+// ATW WhatsApp Bot — server.js (v10.1)
 // Aircraft Transport Worldwide — AOG Inquiry Bot
 // Architecture: Twilio → Bot → Claude → Twilio → WhatsApp
 //               Bot mirrors all messages to Chatwoot
@@ -250,7 +250,7 @@ async function findOrCreateContact(phone) {
     if (searchRes.ok) {
       const searchData = await searchRes.json();
       const existing = searchData?.payload?.[0];
-      if (existing) return existing.id;
+      if (existing) { console.log(`[CHATWOOT] Found existing contact ${existing.id} for ${phone}`); return existing.id; }
     }
     const createRes = await fetch(
       `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`,
@@ -260,8 +260,9 @@ async function findOrCreateContact(phone) {
         body: JSON.stringify({ phone_number: clean, name: clean }),
       }
     );
-    if (!createRes.ok) return null;
+    if (!createRes.ok) { console.error("[CHATWOOT] createContact error:", await createRes.text()); return null; }
     const created = await createRes.json();
+    console.log(`[CHATWOOT] Created contact ${created.id} for ${phone}`);
     return created?.id || null;
   } catch (err) {
     console.error("[CHATWOOT] findOrCreateContact error:", err.message);
@@ -283,7 +284,7 @@ async function createChatwootConversation(contactId, phone) {
         }),
       }
     );
-    if (!res.ok) { const err = await res.text(); console.error("[CHATWOOT] createConversation error:", res.status, err); return null; }
+    if (!res.ok) { console.error("[CHATWOOT] createConversation error:", res.status, await res.text()); return null; }
     const data = await res.json();
     console.log(`[CHATWOOT] Created conversation ${data.id} for ${phone}`);
     return data.id;
@@ -317,8 +318,7 @@ async function mirrorToChatwoot(chatwootConvId, content, isBot) {
       }
     );
     if (!res.ok) {
-      const err = await res.text();
-      console.error(`[CHATWOOT] mirrorToChatwoot error ${res.status}:`, err);
+      console.error(`[CHATWOOT] mirrorToChatwoot error ${res.status}:`, await res.text());
     } else {
       console.log(`[CHATWOOT] Mirrored ${isBot ? "bot" : "customer"} message to conversation ${chatwootConvId}`);
     }
@@ -426,7 +426,7 @@ async function classifyAndAlert(phone, messages) {
           <div style="background:#f1f5f9;padding:16px;border-radius:8px;font-size:13px;line-height:1.6;">${transcriptHtml}</div>
         </div>
         <p style="color:#94a3b8;font-size:11px;text-align:center;margin-top:16px;">
-          ATW WhatsApp Bot v10.0 — ${new Date().toISOString()}
+          ATW WhatsApp Bot v10.1 — ${new Date().toISOString()}
         </p>
       </div>`;
 
@@ -543,18 +543,19 @@ app.post("/chatwoot-webhook", async (req, res) => {
     const event      = payload.event;
     const msgType    = payload.message_type;
     const content    = payload.content;
-    const senderType = payload.sender?.type;
+    // Chatwoot sends sender_type at root level, not nested under sender object
+    const senderType = payload.sender_type || payload.sender?.type;
 
-    // Log everything before any filtering
     console.log(`[CHATWOOT-WEBHOOK] Received — event=${event} msgType=${msgType} senderType=${senderType} content="${String(content || "").slice(0, 80)}"`);
-    console.log(`[CHATWOOT-WEBHOOK] Full payload: ${JSON.stringify(payload, null, 2)}`);
 
     if (event !== "message_created") { console.log("[CHATWOOT-WEBHOOK] Ignored — not message_created"); return; }
     if (msgType !== "outgoing") { console.log("[CHATWOOT-WEBHOOK] Ignored — not outgoing"); return; }
     if (senderType !== "agent") { console.log(`[CHATWOOT-WEBHOOK] Ignored — senderType is "${senderType}", not agent`); return; }
     if (!content || String(content).trim() === "") { console.log("[CHATWOOT-WEBHOOK] Ignored — empty content"); return; }
 
-    const phone = payload.conversation?.meta?.sender?.phone_number
+    // Phone stored in conversation additional_attributes when we created it
+    const phone = payload.conversation?.additional_attributes?.phone
+               || payload.conversation?.meta?.sender?.phone_number
                || payload.meta?.sender?.phone_number;
 
     if (!phone) { console.warn("[CHATWOOT-WEBHOOK] No phone found in payload."); return; }
@@ -589,14 +590,14 @@ app.post("/chatwoot-webhook", async (req, res) => {
 
 // ── Health check ───────────────────────────────────────────────
 app.get("/", (_req, res) => {
-  res.send(`ATW WhatsApp Bot v10.0 running. Active conversations: ${conversationHistory.size}. Agent takeovers: ${agentTakeover.size}`);
+  res.send(`ATW WhatsApp Bot v10.1 running. Active conversations: ${conversationHistory.size}. Agent takeovers: ${agentTakeover.size}`);
 });
 
 // ── Start server ───────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("============================================");
-  console.log("ATW WhatsApp Bot v10.0 — Twilio + Chatwoot");
+  console.log("ATW WhatsApp Bot v10.1 — Twilio + Chatwoot");
   console.log("Server running on port " + PORT);
   console.log("Incoming webhook:  POST /webhook");
   console.log("Chatwoot webhook:  POST /chatwoot-webhook");
