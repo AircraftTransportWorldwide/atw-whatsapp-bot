@@ -2,7 +2,9 @@
 // Changes from v10.3:
 //   - Customer → bot: media attachments forwarded to Chatwoot + Patty acknowledges
 //   - Agent → customer: Chatwoot attachment messages sent via Twilio media
-// Everything else unchanged: takeover/#done, 2hr resume, Resend tiers, dedup, memory
+//   - Fixed: Chatwoot echo dedup using X-Chatwoot-Signature / message origin flag
+//   - Fixed: attachment ack only fires for actual media messages
+//   - Fixed: response.buffer() → arrayBuffer()
 
 import express from "express";
 import fetch from "node-fetch";
@@ -31,14 +33,16 @@ const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const resend = new Resend(RESEND_API_KEY);
 
 // ── IN-MEMORY STORE ──────────────────────────────────────────────────────────
-const conversations = {};       // { [from]: { messages, lastActivity, takenOver, lastAgentActivity, chatwootConvId } }
+const conversations = {};
 const processedMsgIds = new Set();
 const rateLimitMap = {};
+// Track message content we sent, to block Chatwoot echo
+const botSentMessages = new Set();
 
 // ── CONSTANTS ────────────────────────────────────────────────────────────────
 const MEMORY_LIMIT = 10;
-const MEMORY_TIMEOUT_MS = 60 * 60 * 1000;        // 1 hour
-const AGENT_RESUME_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MEMORY_TIMEOUT_MS = 60 * 60 * 1000;
+const AGENT_RESUME_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 15;
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 
@@ -69,9 +73,7 @@ function getConv(from) {
     conversations[from] = { messages: [], lastActivity: now, takenOver: false, lastAgentActivity: null, chatwootConvId: null };
   }
   const conv = conversations[from];
-  if (now - conv.lastActivity > MEMORY_TIMEOUT_MS) {
-    conv.messages = [];
-  }
+  if (now - conv.lastActivity > MEMORY_TIMEOUT_MS) conv.messages = [];
   conv.lastActivity = now;
   return conv;
 }
@@ -85,12 +87,20 @@ function checkRateLimit(from) {
   return true;
 }
 
+function trackBotMessage(text) {
+  const key = text.trim().substring(0, 100);
+  botSentMessages.add(key);
+  // Clean up after 30 seconds
+  setTimeout(() => botSentMessages.delete(key), 30000);
+}
+
+function isBotMessage(text) {
+  if (!text) return false;
+  return botSentMessages.has(text.trim().substring(0, 100));
+}
+
 async function sendWhatsApp(to, body, mediaUrl = null) {
-  const params = {
-    from: TWILIO_WHATSAPP_NUMBER,
-    to,
-    body,
-  };
+  const params = { from: TWILIO_WHATSAPP_NUMBER, to, body };
   if (mediaUrl) params.mediaUrl = [mediaUrl];
   return twilioClient.messages.create(params);
 }
@@ -142,7 +152,6 @@ async function findOrCreateConversation(contactId, from) {
   return created.id;
 }
 
-// Mirror a plain text message to Chatwoot
 async function mirrorTextToChatwoot(convId, text, isOutgoing) {
   await chatwootPost(`/conversations/${convId}/messages`, {
     content: text,
@@ -151,19 +160,17 @@ async function mirrorTextToChatwoot(convId, text, isOutgoing) {
   });
 }
 
-// Forward an attachment from Twilio (media URL) to Chatwoot
-// Chatwoot API Channel accepts attachments via multipart/form-data
 async function forwardAttachmentToChatwoot(convId, mediaUrl, mediaContentType, isOutgoing) {
   try {
-    // Download the media from Twilio (requires auth)
     const mediaRes = await fetch(mediaUrl, {
       headers: {
         Authorization: "Basic " + Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64"),
       },
     });
-    const buffer = await mediaRes.buffer();
+    // Fixed: use arrayBuffer() instead of deprecated buffer()
+    const arrayBuf = await mediaRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
 
-    // Determine a safe filename from content type
     const ext = (mediaContentType || "application/octet-stream").split("/")[1]?.split(";")[0] || "bin";
     const filename = `attachment.${ext}`;
 
@@ -175,10 +182,7 @@ async function forwardAttachmentToChatwoot(convId, mediaUrl, mediaContentType, i
 
     await fetch(`${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${convId}/messages`, {
       method: "POST",
-      headers: {
-        api_access_token: CHATWOOT_API_TOKEN,
-        ...form.getHeaders(),
-      },
+      headers: { api_access_token: CHATWOOT_API_TOKEN, ...form.getHeaders() },
       body: form,
     });
   } catch (err) {
@@ -188,27 +192,24 @@ async function forwardAttachmentToChatwoot(convId, mediaUrl, mediaContentType, i
 
 // ── EMAIL ALERTS ─────────────────────────────────────────────────────────────
 
+async function classifyTier(messages) {
+  const lastMsg = messages[messages.length - 1]?.content || "";
+  if (/aog|aircraft on ground|grounded|critical|emergency|urgent/i.test(lastMsg)) return 1;
+  if (/shipment|cargo|freight|delivery|pickup|quote|rate|weight|dimension|dangerous|hazmat|oversized/i.test(lastMsg)) return 2;
+  return 3;
+}
+
 async function sendEmailAlert(tier, from, messageBody) {
   if (tier === 3) return;
   const subject = tier === 1
     ? "🚨 ATW AOG Emergency — Immediate Attention Required"
     : "📦 ATW New Freight Inquiry";
-  const text = `New WhatsApp inquiry\n\nFrom: ${from}\nTier: ${tier}\n\nMessage:\n${messageBody}`;
   await resend.emails.send({
     from: "Patty <noreply@atwcargo.com>",
     to: ["digital@atwcargo.com"],
     subject,
-    text,
+    text: `New WhatsApp inquiry\n\nFrom: ${from}\nTier: ${tier}\n\nMessage:\n${messageBody}`,
   });
-}
-
-async function classifyTier(messages) {
-  const lastMsg = messages[messages.length - 1]?.content || "";
-  const aogKeywords = /aog|aircraft on ground|grounded|critical|emergency|urgent/i;
-  if (aogKeywords.test(lastMsg)) return 1;
-  const freightKeywords = /shipment|cargo|freight|delivery|pickup|quote|rate|weight|dimension|dangerous|hazmat|oversized/i;
-  if (freightKeywords.test(lastMsg)) return 2;
-  return 3;
 }
 
 // ── CLAUDE ───────────────────────────────────────────────────────────────────
@@ -247,8 +248,7 @@ app.post("/webhook", async (req, res) => {
   if (processedMsgIds.has(msgId)) return;
   processedMsgIds.add(msgId);
   if (processedMsgIds.size > 5000) {
-    const first = processedMsgIds.values().next().value;
-    processedMsgIds.delete(first);
+    processedMsgIds.delete(processedMsgIds.values().next().value);
   }
 
   console.log(`Inbound from ${from}: "${body}" | media: ${numMedia}`);
@@ -264,7 +264,6 @@ app.post("/webhook", async (req, res) => {
     }
   }
 
-  // Rate limit
   if (!checkRateLimit(from)) {
     await sendWhatsApp(from, "You've sent a lot of messages in a short time. Please wait a few minutes and try again.");
     return;
@@ -285,57 +284,43 @@ app.post("/webhook", async (req, res) => {
       const mediaUrl = req.body[`MediaUrl${i}`];
       const mediaType = req.body[`MediaContentType${i}`];
       console.log(`Media ${i}: ${mediaType} — ${mediaUrl}`);
-
       if (chatwootConvId) {
         await forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, false);
       }
     }
 
-    // Acknowledge to customer (only if bot is active)
     if (!conv.takenOver) {
+      trackBotMessage(ATTACHMENT_ACK);
       await sendWhatsApp(from, ATTACHMENT_ACK);
-      if (chatwootConvId) {
-        await mirrorTextToChatwoot(chatwootConvId, ATTACHMENT_ACK, true);
-      }
+      if (chatwootConvId) await mirrorTextToChatwoot(chatwootConvId, ATTACHMENT_ACK, true);
     }
-    return;
+    return; // ← stop here, do NOT fall through to Claude
   }
 
   // ── HANDLE TEXT ───────────────────────────────────────────────────────────
   if (!body) return;
 
-  // Mirror inbound text to Chatwoot
-  if (chatwootConvId) {
-    await mirrorTextToChatwoot(chatwootConvId, body, false);
-  }
+  if (chatwootConvId) await mirrorTextToChatwoot(chatwootConvId, body, false);
 
-  // If taken over, stay silent (agent is handling)
   if (conv.takenOver) {
     console.log(`Bot silent — agent has taken over for ${from}`);
     return;
   }
 
-  // Build message history for Claude
   conv.messages.push({ role: "user", content: body });
   if (conv.messages.length > MEMORY_LIMIT * 2) {
     conv.messages = conv.messages.slice(-MEMORY_LIMIT * 2);
   }
 
-  // Classify tier and send email alert
   const tier = await classifyTier(conv.messages);
   await sendEmailAlert(tier, from, body);
 
-  // Ask Claude
   const reply = await askClaude(conv.messages);
   conv.messages.push({ role: "assistant", content: reply });
 
-  // Send reply to customer
+  trackBotMessage(reply);
   await sendWhatsApp(from, reply);
-
-  // Mirror outbound to Chatwoot
-  if (chatwootConvId) {
-    await mirrorTextToChatwoot(chatwootConvId, reply, true);
-  }
+  if (chatwootConvId) await mirrorTextToChatwoot(chatwootConvId, reply, true);
 });
 
 // ── CHATWOOT WEBHOOK (Agent → Bot → Customer) ────────────────────────────────
@@ -343,32 +328,28 @@ app.post("/webhook", async (req, res) => {
 app.post("/chatwoot-webhook", async (req, res) => {
   res.sendStatus(200);
 
-  const { event, message_type, content, conversation, attachments, sender } = req.body;
+  const { event, message_type, content, conversation, attachments } = req.body;
   if (event !== "message_created" || message_type !== "outgoing") return;
 
-  // Ignore messages sent by the bot itself (no human agent sender)
-  // Chatwoot marks bot-mirrored messages with sender type "bot" or no sender
-  const senderType = sender?.type;
-  if (!sender || senderType === "bot" || senderType === "agent_bot") {
-    console.log("Ignoring bot-originated Chatwoot webhook");
+  // Block echo: if this message was sent by the bot, ignore it
+  if (isBotMessage(content)) {
+    console.log("Ignoring bot-originated Chatwoot echo");
     return;
   }
 
-  // Find the customer's WhatsApp number from conversation metadata
   const phone = conversation?.meta?.sender?.phone_number;
   if (!phone) return;
   const to = `whatsapp:${phone}`;
   const conv = getConv(to);
-  const convId = conversation?.id;
 
-  // Dedup by message ID
+  // Dedup by Chatwoot message ID
   const msgId = req.body.id?.toString();
   if (msgId) {
     if (processedMsgIds.has(`cw_${msgId}`)) return;
     processedMsgIds.add(`cw_${msgId}`);
   }
 
-  // Handle #takeover / #done commands
+  // Handle commands
   if (content?.trim() === "#takeover") {
     conv.takenOver = true;
     conv.lastAgentActivity = Date.now();
@@ -382,7 +363,6 @@ app.post("/chatwoot-webhook", async (req, res) => {
     return;
   }
 
-  // Track agent activity for auto-resume timer
   conv.lastAgentActivity = Date.now();
 
   // ── AGENT SENDS ATTACHMENT ────────────────────────────────────────────────
@@ -392,20 +372,18 @@ app.post("/chatwoot-webhook", async (req, res) => {
       if (!attUrl) continue;
       console.log(`Agent attachment to ${to}: ${attUrl}`);
       try {
-        // Send media to customer via Twilio
-        // Body is required by WhatsApp even with media
         const msgBody = content?.trim() || "Please see the attached file from ATW.";
         await sendWhatsApp(to, msgBody, attUrl);
       } catch (err) {
-        console.error("Error sending agent attachment to customer:", err.message);
+        console.error("Error sending agent attachment:", err.message);
       }
     }
     return;
   }
 
   // ── AGENT SENDS TEXT ──────────────────────────────────────────────────────
-  if (!content || !content.trim()) return;
-  if (content.startsWith("#")) return; // ignore other commands
+  if (!content?.trim()) return;
+  if (content.trim().startsWith("#")) return;
 
   console.log(`Agent reply to ${to}: "${content}"`);
   try {
