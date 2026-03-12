@@ -235,7 +235,8 @@ async function askClaude(messages) {
 // ── INBOUND WEBHOOK (Twilio → Bot) ───────────────────────────────────────────
 
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.set("Content-Type", "text/xml");
+  res.send("<Response></Response>");
 
   const from = req.body.From;
   const msgId = req.body.MessageSid;
@@ -342,8 +343,16 @@ app.post("/webhook", async (req, res) => {
 app.post("/chatwoot-webhook", async (req, res) => {
   res.sendStatus(200);
 
-  const { event, message_type, content, conversation, attachments } = req.body;
+  const { event, message_type, content, conversation, attachments, sender } = req.body;
   if (event !== "message_created" || message_type !== "outgoing") return;
+
+  // Ignore messages sent by the bot itself (no human agent sender)
+  // Chatwoot marks bot-mirrored messages with sender type "bot" or no sender
+  const senderType = sender?.type;
+  if (!sender || senderType === "bot" || senderType === "agent_bot") {
+    console.log("Ignoring bot-originated Chatwoot webhook");
+    return;
+  }
 
   // Find the customer's WhatsApp number from conversation metadata
   const phone = conversation?.meta?.sender?.phone_number;
