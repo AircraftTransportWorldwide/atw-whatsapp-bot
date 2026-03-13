@@ -1,5 +1,8 @@
-// ATW WhatsApp Bot v10.12
-// Changes from v10.11:
+// ATW WhatsApp Bot v10.13
+// Changes from v10.12:
+// - Email now waits for conversation to have enough substance before sending:
+//   fires only when customer has sent 3+ messages AND at least 2 key fields
+//   (origin, destination, commodity/part number, weight) are present in the transcript
 // - Extended Redis MEMORY_TTL from 1 hour to 24 hours
 // - Fixed Monday column IDs to match real board schema (verified via MCP)
 // - Fixed Monday column value formats (status uses {label:}, long_text uses {text:})
@@ -448,6 +451,22 @@ function getAttachmentAck(lang) {
   return acks[lang] || acks['en'];
 }
 
+// ─── Email readiness check ─────────────────────────────────────────────────────
+function isEmailReady(messages) {
+  const customerMessages = messages.filter(m => m.role === 'user');
+  if (customerMessages.length < 3) return false;
+
+  const fullText = customerMessages.map(m => m.content).join(' ').toLowerCase();
+  let fieldsFound = 0;
+
+  if (/from\s+[a-zA-Z]/.test(fullText) || /\b(mia|miami|jfk|lax|ord|lhr|cdg|ams|dxb|nbo|bog|gru|mex)\b/.test(fullText)) fieldsFound++;
+  if (/\bto\b.{1,30}(airport|city|country)|\b(london|heathrow|lhr|paris|dubai|tokyo|bogota|sao paulo|nairobi)\b/.test(fullText) || /(?:to|hacia|para)\s+[a-zA-Z]/.test(fullText)) fieldsFound++;
+  if (/\d+\s*(kg|kgs|kilos|lbs|pounds)|part\s*(number|#|no)?[\s:]*[a-zA-Z0-9\-]{5,}|hydraulic|pump|engine|avionics|component|gear|actuator|sensor/.test(fullText)) fieldsFound++;
+  if (/\d+\s*x\s*\d+|\bdimensions?\b|\bweight\b|\bkg\b|\blbs\b/.test(fullText)) fieldsFound++;
+
+  return fieldsFound >= 2;
+}
+
 // ─── Email alert ───────────────────────────────────────────────────────────────
 async function generateEmailSummary(messages) {
   try {
@@ -745,7 +764,7 @@ app.post('/webhook', async (req, res) => {
   await setMem(from, mem);
 
   // ── Email alert ──
-  if ((tier === 1 || tier === 2) && (!mem.emailSent || isEscalation)) {
+  if ((tier === 1 || tier === 2) && (!mem.emailSent || isEscalation) && isEmailReady(mem.messages)) {
     await sendEmailAlert(tier, from, mem.messages, mem.refNumber);
     mem.emailSent = true;
     await setMem(from, mem);
@@ -879,7 +898,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.12 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.13 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.12 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.13 running on port ${PORT}`));
