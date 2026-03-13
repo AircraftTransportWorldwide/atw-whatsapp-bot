@@ -608,7 +608,13 @@ app.post('/webhook', async (req, res) => {
       console.error('[Attachment] Failed to forward to Chatwoot:', err.message);
     }
     // Patty acknowledges attachment in customer's language
-    const lang = await detectLanguage(text || 'hello');
+    // Use recent conversation history for language detection, not just the current message
+    const recentText = mem.messages
+      .filter(m => m.role === 'user')
+      .slice(-3)
+      .map(m => m.content)
+      .join(' ') || text || 'hello';
+    const lang = await detectLanguage(recentText);
     const ack = await detectLanguageAck(lang);
     await sendWhatsApp(from, ack);
     if (chatwootConvId) await sendChatwootMessage(chatwootConvId, ack);
