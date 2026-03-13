@@ -1,6 +1,7 @@
-// ATW WhatsApp Bot v10.9
-// Changes from v10.8:
-// - Fixed double message to customer: reply and ref-number message are now sent as one combined message (if/else), never two
+// ATW WhatsApp Bot v10.9.1
+// Changes from v10.9:
+// - Fixed Twenty GraphQL mutations: createPerson→createPeople, input→data, updatePerson→updatePeople
+// - Fixed Twenty queries: PersonFilterInput→PersonFilter, CreatePersonInput removed
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -170,7 +171,7 @@ async function findOrCreateContact(phone, name) {
   const cleanPhone = phone.replace('whatsapp:', '');
 
   const searchResult = await twentyQuery(`
-    query FindPeople($filter: PersonFilterInput) {
+    query FindPeople($filter: PersonFilter) {
       people(filter: $filter) {
         edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } }
       }
@@ -187,20 +188,20 @@ async function findOrCreateContact(phone, name) {
   }
 
   const createResult = await twentyQuery(`
-    mutation CreatePerson($input: CreatePersonInput!) {
-      createPerson(input: $input) { id name { firstName lastName } }
+    mutation CreatePeople($data: PersonCreateInput!) {
+      createPeople(data: $data) { id name { firstName lastName } }
     }
   `, {
-    input: {
+    data: {
       name: { firstName: name || 'WhatsApp', lastName: cleanPhone },
       phones: { primaryPhoneNumber: cleanPhone, primaryPhoneCountryCode: '+1' }
     }
   });
 
-  if (createResult?.createPerson) {
-    const contact = { id: createResult.createPerson.id, name: null };
+  if (createResult?.createPeople) {
+    const contact = { id: createResult.createPeople.id, name: null };
     await setTwentyCache(phone, contact);
-    console.log(`[Twenty] Created contact: ${createResult.createPerson.id}`);
+    console.log(`[Twenty] Created contact: ${createResult.createPeople.id}`);
     return contact;
   }
   return null;
@@ -208,7 +209,7 @@ async function findOrCreateContact(phone, name) {
 
 async function getInquiryHistory(contactId) {
   const result = await twentyQuery(`
-    query GetInquiries($filter: InquiryFilterInput) {
+    query GetInquiries($filter: InquiryFilter) {
       inquiries(
         filter: $filter,
         orderBy: { createdAt: DescNullsLast },
@@ -250,11 +251,11 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
   const langMap = { en: 'EN', es: 'ES', pt: 'PT' };
 
   const result = await twentyQuery(`
-    mutation CreateInquiry($input: CreateInquiryInput!) {
-      createInquiry(input: $input) { id referenceNumber }
+    mutation CreateInquiry($data: InquiryCreateInput!) {
+      createInquiry(data: $data) { id referenceNumber }
     }
   `, {
-    input: {
+    data: {
       referenceNumber: mem.refNumber || generateRefNumber(),
       tier:            tierValue,
       status:          'CLOSED_BOT',
@@ -844,7 +845,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9.1 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9.1 running on port ${PORT}`));
