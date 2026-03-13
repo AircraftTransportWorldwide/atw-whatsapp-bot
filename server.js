@@ -913,7 +913,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.14 — online'));
-
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.15 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.14 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.15 running on port ${PORT}`));
