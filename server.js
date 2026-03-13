@@ -1,5 +1,8 @@
-// ATW WhatsApp Bot v10.14
-// Changes from v10.13:
+// ATW WhatsApp Bot v10.15
+// Changes from v10.14:
+// - Fixed Twenty InquiryFilterInput: personId → person.id.eq (relation filter syntax)
+// - Fixed Twenty InquiryCreateInput: personId → person.connect.id (relation connect syntax)
+// - Fixed Monday long_text column value: { text: } wrapper → plain string
 // - Removed primaryPhoneCountryCode from Twenty contact create (was causing errors with both '+1' and '1')
 // - Fixed Monday stale item ID bug: mondayItemId and twentyInquiryId reset on fresh session
 //   so bot never tries to update an inactive item from a previous Redis session
