@@ -1,13 +1,6 @@
-// ATW WhatsApp Bot v10.8
-// Changes from v10.7:
-// - Fixed Twenty API endpoint /api → /graphql (all writes were silently failing)
-// - Replaced Opportunity/Deal with custom Inquiry object (df1a6f78-8b1a-481d-b394-ed047cad32e4)
-// - Inquiry writes all 11 fields: ref, tier, status, language, escalated, origin, destination, commodity, weight, phone, transcript
-// - Returning customer recognition now reads from Inquiry history (not notes)
-// - Inquiry updated on escalation and on #done
-// - Monday integration unchanged
-// - Reference number unchanged
-// - Takeover/dedup fixes from v10.7 unchanged
+// ATW WhatsApp Bot v10.9
+// Changes from v10.8:
+// - Fixed double message to customer: reply and ref-number message are now sent as one combined message (if/else), never two
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -93,7 +86,7 @@ const CHATWOOT_ACCOUNT  = process.env.CHATWOOT_ACCOUNT_ID || '1';
 const CHATWOOT_INBOX    = process.env.CHATWOOT_INBOX_ID   || '4';
 const TWENTY_API_URL    = process.env.TWENTY_API_URL;
 const TWENTY_API_KEY    = process.env.TWENTY_API_KEY;
-const TWENTY_INQUIRY_ID = 'df1a6f78-8b1a-481d-b394-ed047cad32e4'; // Inquiry object metadata ID
+const TWENTY_INQUIRY_ID = 'df1a6f78-8b1a-481d-b394-ed047cad32e4';
 const FROM_NUMBER       = process.env.TWILIO_WHATSAPP_NUMBER;
 const MONDAY_API_KEY    = process.env.MONDAY_API_KEY;
 const MONDAY_BOARD_ID   = process.env.MONDAY_BOARD_ID;
@@ -170,7 +163,6 @@ async function twentyQuery(query, variables = {}) {
   } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
-// Find or create contact (person) in Twenty
 async function findOrCreateContact(phone, name) {
   const cached = await getTwentyCache(phone);
   if (cached) return cached;
@@ -214,7 +206,6 @@ async function findOrCreateContact(phone, name) {
   return null;
 }
 
-// Get inquiry history for a contact — used for returning customer recognition
 async function getInquiryHistory(contactId) {
   const result = await twentyQuery(`
     query GetInquiries($filter: InquiryFilterInput) {
@@ -244,14 +235,12 @@ async function getInquiryHistory(contactId) {
   return result?.inquiries?.edges?.map(e => e.node) || [];
 }
 
-// Create a new Inquiry record in Twenty
 async function createTwentyInquiry(contactId, phone, tier, mem) {
   if (!contactId) return null;
   const cleanPhone = phone.replace('whatsapp:', '');
   const tierValue  = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
 
-  // Extract shipment details from conversation
   const fullText    = mem.messages.map(m => m.content).join(' ');
   const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
   const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
@@ -288,7 +277,6 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
   return null;
 }
 
-// Update existing inquiry (escalation or #done)
 async function updateTwentyInquiry(inquiryId, updates) {
   if (!inquiryId) return;
   const result = await twentyQuery(`
@@ -299,7 +287,6 @@ async function updateTwentyInquiry(inquiryId, updates) {
   if (result?.updateInquiry) console.log(`[Twenty] Updated inquiry: ${inquiryId}`);
 }
 
-// Post a note to the contact (for profile note in Chatwoot)
 async function postContactNote(contactId, phone, refNumber, summary) {
   if (!contactId) return;
   const cleanPhone = phone.replace('whatsapp:', '');
@@ -315,7 +302,6 @@ async function postContactNote(contactId, phone, refNumber, summary) {
   console.log(`[Twenty] Note posted for contact ${contactId}`);
 }
 
-// Post Chatwoot profile note with Twenty data
 async function postChatwootProfileNote(chatwootConvId, contact, phone, inquiryHistory) {
   if (!chatwootConvId) return;
   const cleanPhone = phone.replace('whatsapp:', '');
@@ -603,11 +589,9 @@ app.post('/webhook', async (req, res) => {
       if (twentyContact.name && !mem.customerName) {
         mem.customerName = twentyContact.name;
       }
-      // Fetch inquiry history for returning customer recognition
       inquiryHistory = await getInquiryHistory(twentyContact.id);
       if (inquiryHistory.length > 0) {
         isReturningCustomer = true;
-        // Pull preferred language from last inquiry if not set
         if (!mem.language || mem.language === 'en') {
           const langMap = { EN: 'en', ES: 'es', PT: 'pt' };
           mem.language = langMap[inquiryHistory[0].language] || 'en';
@@ -696,10 +680,6 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'assistant', content: reply });
   await setMem(from, mem);
 
-  // ── Send reply ──
-  await sendWhatsApp(from, reply);
-  if (chatwootConvId) await sendChatwootMessage(chatwootConvId, reply, 'outgoing');
-
   // ── Classify ──
   const tier        = classifyTier(text);
   const prevHighest = mem.highestTier || 3;
@@ -713,18 +693,21 @@ app.post('/webhook', async (req, res) => {
     console.log(`[Ref] Generated ${mem.refNumber}`);
   }
 
-  // ── Inject ref number into reply once ──
+  // ── Send reply (with ref number injected if needed — single message, never two) ──
   if (mem.refNumber && !mem.refSentToCustomer) {
     const langAck = {
       es: `Tu número de referencia es ${mem.refNumber}. Guárdalo para cualquier seguimiento.`,
       pt: `Seu número de referência é ${mem.refNumber}. Guarde-o para qualquer acompanhamento.`,
       en: `I've logged your inquiry under reference number ${mem.refNumber}. Please keep this handy for any follow-up.`
     };
-    const refLine = langAck[mem.language] || langAck['en'];
+    const refLine  = langAck[mem.language] || langAck['en'];
     const refReply = `${reply}\n\n${refLine}`;
     mem.refSentToCustomer = true;
     await sendWhatsApp(from, refReply);
     if (chatwootConvId) await sendChatwootMessage(chatwootConvId, refReply, 'outgoing');
+  } else {
+    await sendWhatsApp(from, reply);
+    if (chatwootConvId) await sendChatwootMessage(chatwootConvId, reply, 'outgoing');
   }
 
   await setMem(from, mem);
@@ -747,7 +730,6 @@ app.post('/webhook', async (req, res) => {
           await setMem(from, mem);
         }
       } else if (isEscalation && mem.twentyInquiryId) {
-        // Escalation — update tier, status, escalated flag, transcript
         const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
         await updateTwentyInquiry(mem.twentyInquiryId, {
           tier:      'AOG_EMERGENCY',
@@ -790,7 +772,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
 
   const { event, message_type, content, conversation, private: isPrivate, attachments } = req.body;
 
-  // Drop private notes — never forward to customer
   if (isPrivate) return;
   if (event !== 'message_created' || message_type !== 'outgoing') return;
 
@@ -803,7 +784,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   const text  = (content || '').trim();
   const msgId = req.body?.message?.id?.toString();
 
-  // Dedup
   if (await isChatwootDuplicate(convId, text, msgId)) {
     console.log(`[CW Dedup] Skipped duplicate for conv ${convId}`);
     return;
@@ -822,15 +802,11 @@ app.post('/chatwoot-webhook', async (req, res) => {
     const mem = await getMem(to);
     if (mem) {
       const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-
-      // Update Monday with final transcript
       if (mem.mondayItemId) {
         updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err =>
           console.error('[Monday] Final update failed:', err.message)
         );
       }
-
-      // Update Twenty inquiry status to agent handled
       if (mem.twentyInquiryId) {
         updateTwentyInquiry(mem.twentyInquiryId, {
           status:     'CLOSED_AGENT',
@@ -844,11 +820,9 @@ app.post('/chatwoot-webhook', async (req, res) => {
     return;
   }
 
-  // Must be in takeover to forward
   const takeoverState = await getTakeover(convId);
   if (!takeoverState?.active) return;
 
-  // Block bot echo
   if (msgId && await isBotMessage(msgId)) {
     console.log(`[Echo] Blocked bot echo for ${msgId}`);
     return;
@@ -870,7 +844,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.8 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.8 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9 running on port ${PORT}`));
