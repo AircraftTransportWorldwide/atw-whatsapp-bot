@@ -1,8 +1,19 @@
-// ATW WhatsApp Bot v10.9.2
-// Changes from v10.9.1:
-// - Fixed Twenty query filter: PersonFilter → PersonFilterInput (correct for v0.60.7)
-// - Fixed Twenty create: PersonCreateInput must be wrapped in array [PersonCreateInput!]
-// - Fixed Twenty create: createPeople returns array, access result as [0]
+// ATW WhatsApp Bot v10.10
+// Changes from v10.9.2:
+// - Fixed Monday column IDs to match real board schema (verified via MCP)
+// - Fixed Monday column value formats (status uses {label:}, long_text uses {text:})
+// - Fixed Monday GraphQL mutation names: create_item → create_item (kept), change_multiple_column_values kept
+// - Renamed board reference: all Monday column IDs now use verified IDs
+// - Monday column map:
+//     Customer Name → "name" (item title, not a column value)
+//     Phone         → "text_mm1dj5cb"
+//     Tier          → "color_mm1dx2x3"  (status: "AOG Emergency" | "Freight Inquiry")
+//     Source        → "text_mm1d77a4"
+//     Reference     → "text_mm1dpm0d"
+//     Language      → "color_mm1dqhvs"  (status: "English" | "Spanish" | "Portuguese")
+//     Conversation  → "long_text_mm1d52b4"
+//     Status        → "status"           (labels: "Working on it" | "Done" | "Stuck")
+//     Date          → "date4"
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -94,6 +105,18 @@ const MONDAY_API_KEY    = process.env.MONDAY_API_KEY;
 const MONDAY_BOARD_ID   = process.env.MONDAY_BOARD_ID;
 const MEMORY_LIMIT      = 10;
 const TAKEOVER_RESUME   = 2 * 60 * 60 * 1000;
+
+// ─── Monday column IDs (verified March 13 2026) ────────────────────────────────
+const MONDAY_COLS = {
+  phone:        'text_mm1dj5cb',
+  tier:         'color_mm1dx2x3',
+  source:       'text_mm1d77a4',
+  reference:    'text_mm1dpm0d',
+  language:     'color_mm1dqhvs',
+  conversation: 'long_text_mm1d52b4',
+  status:       'status',
+  date:         'date4'
+};
 
 // ─── Reference number ──────────────────────────────────────────────────────────
 function generateRefNumber() {
@@ -349,22 +372,25 @@ async function mondayQuery(query, variables = {}) {
 
 async function createMondayItem(phone, tier, mem) {
   if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
-  const cleanPhone = phone.replace('whatsapp:', '');
-  const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
-  const itemName   = mem.refNumber
+  const cleanPhone  = phone.replace('whatsapp:', '');
+  const tierLabel   = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
+  const langLabel   = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
+  const itemName    = mem.refNumber
     ? `${mem.refNumber} — ${mem.customerName || cleanPhone}`
     : (mem.customerName || cleanPhone);
-  const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+  const today       = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  const now         = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
 
   const columnValues = JSON.stringify({
-    phone:        { text: cleanPhone },
-    reference:    { text: mem.refNumber || '' },
-    tier:         { label: tierLabel },
-    language:     { label: mem.language || 'English' },
-    source:       { text: 'WhatsApp Bot' },
-    status:       { label: 'Closed \u2014 Bot Handled' },
-    conversation: { text: `[${now} ET — bot handled]\n\n${transcript}` }
+    [MONDAY_COLS.phone]:        cleanPhone,
+    [MONDAY_COLS.reference]:    mem.refNumber || '',
+    [MONDAY_COLS.tier]:         { label: tierLabel },
+    [MONDAY_COLS.language]:     { label: langLabel },
+    [MONDAY_COLS.source]:       'WhatsApp Bot',
+    [MONDAY_COLS.status]:       { label: 'Working on it' },
+    [MONDAY_COLS.date]:         { date: today },
+    [MONDAY_COLS.conversation]: { text: `[${now} ET — bot handled]\n\n${transcript}` }
   });
 
   const result = await mondayQuery(
@@ -389,7 +415,7 @@ async function updateMondayItem(itemId, phone, mem, finalTranscript) {
     `mutation UpdateStatus($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
       change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
     }`,
-    { boardId: MONDAY_BOARD_ID, itemId, columnValues: JSON.stringify({ status: { label: 'In Progress' } }) }
+    { boardId: MONDAY_BOARD_ID, itemId, columnValues: JSON.stringify({ [MONDAY_COLS.status]: { label: 'Done' } }) }
   );
   console.log(`[Monday] Updated item ${itemId} with final transcript`);
 }
@@ -756,7 +782,10 @@ app.post('/webhook', async (req, res) => {
           `mutation UpdateItem($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
             change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
           }`,
-          { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, columnValues: JSON.stringify({ tier: { label: 'AOG Emergency' }, status: { label: 'New' } }) }
+          { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, columnValues: JSON.stringify({
+            [MONDAY_COLS.tier]:   { label: 'AOG Emergency' },
+            [MONDAY_COLS.status]: { label: 'Working on it' }
+          })}
         );
         await mondayQuery(
           `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
@@ -846,7 +875,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9.2 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.10 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9.2 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.10 running on port ${PORT}`));
