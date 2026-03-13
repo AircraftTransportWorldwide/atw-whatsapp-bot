@@ -1,12 +1,8 @@
-// ATW WhatsApp Bot v10.6
-// Changes from v10.5:
-// - Redis-based persistent memory (survives restarts/redeployments)
-// - Personalized greeting using Twenty CRM history
-// - Chatwoot private profile note on every new conversation
-// - HTML email with AI-generated summary
-// - Language-aware attachment acknowledgment
-// - Fixed tier classifier with Spanish keywords
-// - Image forwarding fix (arrayBuffer)
+// ATW WhatsApp Bot v10.7
+// Changes from v10.6:
+// - Fixed #takeover/#done confirmation leaking to customer (now truly private note only)
+// - Fixed Chatwoot webhook firing twice via dedup on conversation+content key
+// - Monday.com integration ready (env vars: MONDAY_API_KEY, MONDAY_BOARD_ID)
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -29,11 +25,11 @@ redis.on('connect', () => console.log('[Redis] Connected'));
 await redis.connect();
 
 // ─── Redis helpers ─────────────────────────────────────────────────────────────
-const MEMORY_TTL     = 60 * 60;          // 1 hour in seconds
-const TAKEOVER_TTL   = 3 * 60 * 60;      // 3 hours
-const DEDUP_TTL      = 24 * 60 * 60;     // 24 hours
-const RATE_TTL       = 10 * 60;          // 10 minutes
-const RATE_MAX       = 15;
+const MEMORY_TTL   = 60 * 60;
+const TAKEOVER_TTL = 3 * 60 * 60;
+const DEDUP_TTL    = 24 * 60 * 60;
+const RATE_TTL     = 10 * 60;
+const RATE_MAX     = 15;
 
 async function getMem(phone) {
   const raw = await redis.get(`mem:${phone}`);
@@ -78,6 +74,15 @@ async function setTwentyCache(phone, data) {
   await redis.set(`twenty:${phone}`, JSON.stringify(data), { EX: 24 * 60 * 60 });
 }
 
+// Dedup for Chatwoot webhook — prevents double-firing on same event
+async function isChatwootDuplicate(convId, content, msgId) {
+  const key = `cwdedup:${msgId || convId + ':' + content}`;
+  const exists = await redis.get(key);
+  if (exists) return true;
+  await redis.set(key, '1', { EX: 60 }); // 60 second window is enough
+  return false;
+}
+
 // ─── Config ────────────────────────────────────────────────────────────────────
 const CHATWOOT_URL     = process.env.CHATWOOT_API_URL;
 const CHATWOOT_TOKEN   = process.env.CHATWOOT_API_TOKEN;
@@ -86,13 +91,14 @@ const CHATWOOT_INBOX   = process.env.CHATWOOT_INBOX_ID   || '4';
 const TWENTY_API_URL   = process.env.TWENTY_API_URL;
 const TWENTY_API_KEY   = process.env.TWENTY_API_KEY;
 const FROM_NUMBER      = process.env.TWILIO_WHATSAPP_NUMBER;
+const MONDAY_API_KEY   = process.env.MONDAY_API_KEY;
+const MONDAY_BOARD_ID  = process.env.MONDAY_BOARD_ID;
 const MEMORY_LIMIT     = 10;
-const TAKEOVER_RESUME  = 2 * 60 * 60 * 1000; // 2 hours ms
+const TAKEOVER_RESUME  = 2 * 60 * 60 * 1000;
 
 // ─── Patty System Prompt ───────────────────────────────────────────────────────
 function buildSystemPrompt(customerName, twentyHistory) {
   let contextBlock = '';
-
   if (customerName && twentyHistory?.length > 0) {
     const lastNote = twentyHistory[0];
     const date = new Date(lastNote.createdAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
@@ -142,59 +148,39 @@ async function twentyQuery(query, variables = {}) {
   try {
     const res = await fetch(`${TWENTY_API_URL}/api`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${TWENTY_API_KEY}`
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TWENTY_API_KEY}` },
       body: JSON.stringify({ query, variables })
     });
     const json = await res.json();
     if (json.errors) { console.error('[Twenty] GraphQL errors:', JSON.stringify(json.errors)); return null; }
     return json.data;
-  } catch (err) {
-    console.error('[Twenty] Request failed:', err.message);
-    return null;
-  }
+  } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
 async function findOrCreateContact(phone, name) {
   const cached = await getTwentyCache(phone);
   if (cached) return cached;
-
   const cleanPhone = phone.replace('whatsapp:', '');
   const searchResult = await twentyQuery(`
     query FindPeople($filter: PersonFilterInput) {
-      people(filter: $filter) {
-        edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } }
-      }
+      people(filter: $filter) { edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } } }
     }
   `, { filter: { phones: { primaryPhoneNumber: { like: `%${cleanPhone}%` } } } });
-
   if (searchResult?.people?.edges?.length > 0) {
     const person = searchResult.people.edges[0].node;
     const fullName = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
     const contact = { id: person.id, name: fullName || null };
     await setTwentyCache(phone, contact);
-    console.log(`[Twenty] Found existing contact: ${fullName} (${person.id})`);
     return contact;
   }
-
   const createResult = await twentyQuery(`
     mutation CreatePerson($input: CreatePersonInput!) {
       createPerson(input: $input) { id name { firstName lastName } }
     }
-  `, {
-    input: {
-      name: { firstName: name || 'WhatsApp', lastName: cleanPhone },
-      phones: { primaryPhoneNumber: cleanPhone, primaryPhoneCountryCode: '+1' }
-    }
-  });
-
+  `, { input: { name: { firstName: name || 'WhatsApp', lastName: cleanPhone }, phones: { primaryPhoneNumber: cleanPhone, primaryPhoneCountryCode: '+1' } } });
   if (createResult?.createPerson) {
-    const p = createResult.createPerson;
-    const contact = { id: p.id, name: null };
+    const contact = { id: createResult.createPerson.id, name: null };
     await setTwentyCache(phone, contact);
-    console.log(`[Twenty] Created new contact: ${p.id}`);
     return contact;
   }
   return null;
@@ -220,18 +206,8 @@ async function createDeal(contactId, phone, tier, shipmentInfo) {
     mutation CreateOpportunity($input: CreateOpportunityInput!) {
       createOpportunity(input: $input) { id name }
     }
-  `, {
-    input: {
-      name: dealName,
-      stage: 'NEW',
-      pointOfContactId: contactId,
-      amount: { amountMicros: 0, currencyCode: 'USD' }
-    }
-  });
-  if (result?.createOpportunity) {
-    console.log(`[Twenty] Created deal: ${result.createOpportunity.id}`);
-    return result.createOpportunity.id;
-  }
+  `, { input: { name: dealName, stage: 'NEW', pointOfContactId: contactId, amount: { amountMicros: 0, currencyCode: 'USD' } } });
+  if (result?.createOpportunity) return result.createOpportunity.id;
   return null;
 }
 
@@ -243,17 +219,8 @@ async function postNote(contactId, opportunityId, phone, tier, conversationSumma
   const targets = [{ targetObjectNameSingular: 'person', id: contactId }];
   if (opportunityId) targets.push({ targetObjectNameSingular: 'opportunity', id: opportunityId });
   await twentyQuery(`
-    mutation CreateNote($input: CreateNoteInput!) {
-      createNote(input: $input) { id }
-    }
-  `, {
-    input: {
-      title: `WhatsApp ${tierLabel} — ${cleanPhone}`,
-      body: noteBody,
-      noteTargets: targets
-    }
-  });
-  console.log(`[Twenty] Note posted for contact ${contactId}`);
+    mutation CreateNote($input: CreateNoteInput!) { createNote(input: $input) { id } }
+  `, { input: { title: `WhatsApp ${tierLabel} — ${cleanPhone}`, body: noteBody, noteTargets: targets } });
 }
 
 async function postChatwootProfileNote(chatwootConvId, contact, phone, isReturning) {
@@ -261,31 +228,95 @@ async function postChatwootProfileNote(chatwootConvId, contact, phone, isReturni
   const cleanPhone = phone.replace('whatsapp:', '');
   const twentyUrl = `${TWENTY_API_URL}/objects/people/${contact.id}`;
   const lines = [`📋 CUSTOMER PROFILE — Twenty CRM`, `Phone: ${cleanPhone}`];
-
-  if (isReturning && contact.name) {
-    lines.push(`Name: ${contact.name}`);
-  } else {
-    lines.push(`Name: Unknown (new contact)`);
-  }
-
+  if (isReturning && contact.name) { lines.push(`Name: ${contact.name}`); } else { lines.push(`Name: Unknown (new contact)`); }
   const notes = await getTwentyContactHistory(contact.id);
   if (notes.length > 0) {
     lines.push(`Past WhatsApp inquiries: ${notes.length}`);
     const last = notes[0];
     const date = new Date(last.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     lines.push(`Last inquiry: ${last.title || 'Unknown'} (${date})`);
-    const detail = last.body?.split('\n').find(l =>
-      l.trim() && !l.startsWith('Customer:') && !l.startsWith('Patty:') && !l.includes('WhatsApp')
-    );
+    const detail = last.body?.split('\n').find(l => l.trim() && !l.startsWith('Customer:') && !l.startsWith('Patty:') && !l.includes('WhatsApp'));
     if (detail) lines.push(`Details: ${detail.trim()}`);
   } else {
     lines.push(`Past WhatsApp inquiries: 0`);
     lines.push(`Status: First contact`);
   }
-
   lines.push(`View in Twenty → ${twentyUrl}`);
   await sendChatwootMessage(chatwootConvId, lines.join('\n'), 'outgoing', true);
-  console.log(`[Chatwoot] Posted profile note for ${cleanPhone}`);
+}
+
+// ─── Monday CRM helpers ────────────────────────────────────────────────────────
+async function mondayQuery(query, variables = {}) {
+  if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
+  try {
+    const res = await fetch('https://api.monday.com/v2', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': MONDAY_API_KEY, 'API-Version': '2024-01' },
+      body: JSON.stringify({ query, variables })
+    });
+    const json = await res.json();
+    if (json.errors) { console.error('[Monday] GraphQL errors:', JSON.stringify(json.errors)); return null; }
+    return json.data;
+  } catch (err) { console.error('[Monday] Request failed:', err.message); return null; }
+}
+
+async function createMondayItem(phone, tier, mem) {
+  if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
+  const itemName   = mem.customerName ? `${mem.customerName} — ${cleanPhone}` : cleanPhone;
+  const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+
+  // Build initial conversation transcript
+  const transcript = mem.messages
+    .map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`)
+    .join('\n');
+
+  // Column values — keys must match your board's column IDs exactly
+  const columnValues = JSON.stringify({
+    phone:         { text: cleanPhone },
+    tier:          { label: tierLabel },
+    language:      { label: mem.language || 'English' },
+    source:        { text: 'WhatsApp Bot' },
+    status:        { label: 'New' },
+    conversation:  { text: `[${now} ET — initial]\n\n${transcript}` }
+  });
+
+  const result = await mondayQuery(
+    `mutation CreateItem($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
+      create_item(board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id }
+    }`,
+    { boardId: MONDAY_BOARD_ID, itemName: itemName, columnValues }
+  );
+
+  const itemId = result?.create_item?.id || null;
+  if (itemId) console.log(`[Monday] Created item ${itemId} for ${cleanPhone}`);
+  return itemId;
+}
+
+async function updateMondayItem(itemId, phone, mem, finalTranscript) {
+  if (!MONDAY_API_KEY || !itemId) return;
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+
+  // Post an update (comment) on the item with the final transcript
+  const updateText = `✅ Conversation closed — ${now} ET\n\n${finalTranscript}`;
+  await mondayQuery(
+    `mutation AddUpdate($itemId: ID!, $body: String!) {
+      create_update(item_id: $itemId, body: $body) { id }
+    }`,
+    { itemId, body: updateText }
+  );
+
+  // Also flip status to "In Progress" now that agent has touched it
+  await mondayQuery(
+    `mutation UpdateStatus($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+      change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
+    }`,
+    { boardId: MONDAY_BOARD_ID, itemId, columnValues: JSON.stringify({ status: { label: 'In Progress' } }) }
+  );
+
+  console.log(`[Monday] Updated item ${itemId} with final transcript for ${cleanPhone}`);
 }
 
 // ─── Language helpers ──────────────────────────────────────────────────────────
@@ -294,12 +325,7 @@ async function detectLanguage(text) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 5,
-        system: 'Detect the language of the text. Reply with only the 2-letter ISO code: en, es, pt, de, fr, or other.',
-        messages: [{ role: 'user', content: text }]
-      })
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 5, system: 'Detect the language of the text. Reply with only the 2-letter ISO code: en, es, pt, de, fr, or other.', messages: [{ role: 'user', content: text }] })
     });
     const data = await res.json();
     return data?.content?.[0]?.text?.trim().toLowerCase() || 'en';
@@ -324,110 +350,39 @@ async function generateEmailSummary(messages) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 120,
-        system: 'You are a freight logistics assistant. Write a single plain-text sentence (max 40 words) summarizing the shipment inquiry. Include commodity, origin, destination, and urgency if mentioned. No bullet points, no labels, no markdown.',
-        messages: [{ role: 'user', content: transcript }]
-      })
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 120, system: 'You are a freight logistics assistant. Write a single plain-text sentence (max 40 words) summarizing the shipment inquiry. Include commodity, origin, destination, and urgency if mentioned. No bullet points, no labels, no markdown.', messages: [{ role: 'user', content: transcript }] })
     });
     const data = await res.json();
     return data?.content?.[0]?.text || null;
-  } catch (err) {
-    console.error('[Email] Summary generation failed:', err.message);
-    return null;
-  }
+  } catch (err) { console.error('[Email] Summary generation failed:', err.message); return null; }
 }
 
 async function sendEmailAlert(tier, phone, messages) {
   if (tier === 3) return;
   const cleanPhone = phone.replace('whatsapp:', '');
   const isAOG = tier === 1;
-  const subject = isAOG
-    ? `AOG EMERGENCY — WhatsApp Inquiry from ${cleanPhone}`
-    : `New Shipment Inquiry — WhatsApp from ${cleanPhone}`;
-
+  const subject = isAOG ? `AOG EMERGENCY — WhatsApp Inquiry from ${cleanPhone}` : `New Shipment Inquiry — WhatsApp from ${cleanPhone}`;
   const accentColor = isAOG ? '#CC0000' : '#003366';
   const badgeColor  = isAOG ? '#CC0000' : '#0055A4';
   const badgeText   = isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
   const urgency     = isAOG ? 'AOG / CRITICAL' : 'STANDARD';
-
   const summaryText = await generateEmailSummary(messages) || messages.find(m => m.role === 'user')?.content || '';
-
-  const fullText = messages.map(m => m.content).join(' ');
+  const fullText    = messages.map(m => m.content).join(' ');
   const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
   const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
   const origin      = originMatch?.[1]?.trim() || '—';
   const destination = destMatch?.[1]?.trim() || '—';
-
-  const convRows = messages.map(m => {
+  const convRows    = messages.map(m => {
     const isCustomer = m.role === 'user';
     const label = isCustomer ? 'CLIENT' : 'ATW BOT';
     const color = isCustomer ? '#0055A4' : '#007A33';
-    return `<tr><td style="padding:6px 0;border-top:1px solid #f0f0f0;">
-      <span style="font-weight:700;color:${color};font-size:13px;">${label}:</span>
-      <span style="font-size:13px;color:#333;margin-left:6px;">${m.content}</span>
-    </td></tr>`;
+    return `<tr><td style="padding:6px 0;border-top:1px solid #f0f0f0;"><span style="font-weight:700;color:${color};font-size:13px;">${label}:</span><span style="font-size:13px;color:#333;margin-left:6px;">${m.content}</span></td></tr>`;
   }).join('');
-
-  const html = `<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="X-UA-Compatible" content="IE=edge"></head>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f4;padding:30px 0;">
-  <tr><td align="center" style="padding:0 15px;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:640px;background:#ffffff;border-radius:6px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
-      <tr><td style="background:${accentColor};padding:20px 30px;">
-        <span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:1px;">ATW CARGO</span>
-        <span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span>
-      </td></tr>
-      <tr><td style="background:${badgeColor};padding:10px 30px;">
-        <span style="font-size:13px;font-weight:700;color:#ffffff;letter-spacing:1px;">${badgeText}</span>
-      </td></tr>
-      <tr><td style="padding:24px 30px 8px;">
-        <p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p>
-        <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;">
-          <tr style="background:#f9f9f9;">
-            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Client</td>
-            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td>
-          </tr>
-          <tr>
-            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td>
-            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td>
-          </tr>
-          <tr style="background:#f9f9f9;">
-            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td>
-            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td>
-          </tr>
-          <tr>
-            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td>
-            <td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td>
-          </tr>
-        </table>
-      </td></tr>
-      <tr><td style="padding:20px 30px 8px;">
-        <p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${convRows}</table>
-      </td></tr>
-      <tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;">
-        <span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span>
-      </td></tr>
-    </table>
-  </td></tr>
-</table>
-</body></html>`;
-
+  const html = `<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f4;padding:30px 0;"><tr><td align="center" style="padding:0 15px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:640px;background:#ffffff;border-radius:6px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);"><tr><td style="background:${accentColor};padding:20px 30px;"><span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:1px;">ATW CARGO</span><span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span></td></tr><tr><td style="background:${badgeColor};padding:10px 30px;"><span style="font-size:13px;font-weight:700;color:#ffffff;letter-spacing:1px;">${badgeText}</span></td></tr><tr><td style="padding:24px 30px 8px;"><p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p><table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;"><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Client</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td></tr></table></td></tr><tr><td style="padding:20px 30px 8px;"><p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p><table role="presentation" width="100%" cellpadding="0" cellspacing="0">${convRows}</table></td></tr><tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;"><span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span></td></tr></table></td></tr></table></body></html>`;
   try {
-    await resend.emails.send({
-      from: 'ATW Bot <onboarding@resend.dev>',
-      to: ['digital@atwcargo.com'],
-      subject,
-      html
-    });
+    await resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html });
     console.log(`[Email] Tier ${tier} alert sent`);
-  } catch (err) {
-    console.error('[Email] Failed:', err.message);
-  }
+  } catch (err) { console.error('[Email] Failed:', err.message); }
 }
 
 // ─── Tier classifier ───────────────────────────────────────────────────────────
@@ -469,7 +424,7 @@ async function findOrCreateChatwootContact(phone, name) {
   } catch (err) { console.error('[Chatwoot] Contact error:', err.message); return null; }
 }
 
-async function findOrCreateChatwootConversation(contactId, phone) {
+async function findOrCreateChatwootConversation(contactId) {
   try {
     const convs = await fetch(
       `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT}/contacts/${contactId}/conversations`,
@@ -520,13 +475,10 @@ app.post('/webhook', async (req, res) => {
 
   if (await isRateLimited(from)) { console.log(`[RateLimit] Blocked ${from}`); return; }
 
-  // ── Memory (Redis) ──
   const now = Date.now();
   let mem = await getMem(from);
   const isFirstMessage = !mem || mem.messages.length === 0;
-  if (!mem) {
-    mem = { messages: [], customerName: null, twentyContactId: null, dealCreated: false, emailSent: false, dealId: null };
-  }
+  if (!mem) mem = { messages: [], customerName: null, twentyContactId: null, dealCreated: false, emailSent: false, dealId: null, mondayItemId: null, language: 'en' };
 
   // ── Twenty: find or create contact ──
   let twentyContact = null;
@@ -538,7 +490,6 @@ app.post('/webhook', async (req, res) => {
       if (twentyContact.name && !mem.customerName) {
         mem.customerName = twentyContact.name;
         isReturningCustomer = true;
-        console.log(`[Twenty] Returning customer: ${mem.customerName}`);
       }
     }
   } catch (err) { console.error('[Twenty] Contact lookup failed:', err.message); }
@@ -546,7 +497,7 @@ app.post('/webhook', async (req, res) => {
   // ── Chatwoot contact + conversation ──
   const chatwootContactId = await findOrCreateChatwootContact(from, mem.customerName || from.replace('whatsapp:', ''));
   let chatwootConvId = null;
-  if (chatwootContactId) chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId, from);
+  if (chatwootContactId) chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId);
 
   // ── Post Twenty profile note on first message ──
   if (isFirstMessage && twentyContact && chatwootConvId) {
@@ -589,10 +540,10 @@ app.post('/webhook', async (req, res) => {
         body: fd
       });
     } catch (err) { console.error('[Attachment] Failed to forward to Chatwoot:', err.message); }
-
-    // Language-aware ack using recent conversation history
     const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
     const lang = await detectLanguage(recentText);
+    mem.language = lang;
+    await setMem(from, mem);
     const ack = getAttachmentAck(lang);
     await sendWhatsApp(from, ack);
     await sendChatwootMessage(chatwootConvId, ack);
@@ -608,12 +559,17 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'user', content: text });
   if (mem.messages.length > MEMORY_LIMIT * 2) mem.messages = mem.messages.slice(-MEMORY_LIMIT * 2);
 
-  // ── Fetch Twenty history for personalized greeting (first message only) ──
+  // ── Fetch Twenty history (first message only) ──
   let twentyHistory = [];
   if (isFirstMessage && twentyContact?.id) {
-    try { twentyHistory = await getTwentyContactHistory(twentyContact.id); }
-    catch (err) { console.error('[Twenty] History fetch failed:', err.message); }
+    try { twentyHistory = await getTwentyContactHistory(twentyContact.id); } catch (err) { console.error('[Twenty] History fetch failed:', err.message); }
   }
+
+  // ── Detect language ──
+  try {
+    const detectedLang = await detectLanguage(text);
+    mem.language = detectedLang;
+  } catch (err) { /* keep existing */ }
 
   // ── Call Claude ──
   const systemPrompt = buildSystemPrompt(mem.customerName, isFirstMessage ? twentyHistory : []);
@@ -655,12 +611,28 @@ app.post('/webhook', async (req, res) => {
       }
     } catch (err) { console.error('[Twenty] Deal/note creation failed:', err.message); }
   }
+
+  // ── Monday: create item on first Tier 1/2 trigger ──
+  if ((tier === 1 || tier === 2) && !mem.mondayItemId) {
+    try {
+      const itemId = await createMondayItem(from, tier, mem);
+      if (itemId) {
+        mem.mondayItemId = itemId;
+        await setMem(from, mem);
+      }
+    } catch (err) { console.error('[Monday] Item creation failed:', err.message); }
+  }
 });
 
 // ─── Chatwoot webhook — agent replies ─────────────────────────────────────────
 app.post('/chatwoot-webhook', async (req, res) => {
   res.sendStatus(200);
-  const { event, message_type, content, conversation, attachments } = req.body;
+
+  const { event, message_type, content, conversation, private: isPrivate, attachments } = req.body;
+
+  // Drop private notes immediately — never forward to customer
+  if (isPrivate) return;
+
   if (event !== 'message_created' || message_type !== 'outgoing') return;
 
   const convId = conversation?.id;
@@ -670,28 +642,45 @@ app.post('/chatwoot-webhook', async (req, res) => {
 
   const to   = phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
   const text = (content || '').trim();
+  const msgId = req.body?.message?.id?.toString();
 
-  // ── #takeover / #done ──
-  if (text === '#takeover') {
+  // Dedup — Chatwoot sometimes fires the webhook twice for the same message
+  if (await isChatwootDuplicate(convId, text, msgId)) {
+    console.log(`[CW Dedup] Skipped duplicate for conv ${convId}`);
+    return;
+  }
+
+  // ── #takeover / #done — handle BEFORE checking takeover state ──
+  if (text.toLowerCase() === '#takeover') {
     await setTakeover(convId, { active: true, lastAgentMessage: Date.now() });
+    // Private note only — never reaches Twilio send path
     await sendChatwootMessage(convId, 'Bot is now paused. You have full control. Type #done to hand back.', 'outgoing', true);
     console.log(`[Takeover] Agent took over conv ${convId}`);
     return;
   }
-  if (text === '#done') {
+  if (text.toLowerCase() === '#done') {
+    const mem = await getMem(to);
+    // Post final transcript to Monday if item exists
+    if (mem?.mondayItemId) {
+      const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+      updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err =>
+        console.error('[Monday] Final update failed:', err.message)
+      );
+    }
     await delTakeover(convId);
+    // Private note only
     await sendChatwootMessage(convId, 'Bot has resumed.', 'outgoing', true);
     console.log(`[Takeover] Bot resumed for conv ${convId}`);
     return;
   }
 
+  // Must be in takeover to forward agent messages
   const takeoverState = await getTakeover(convId);
   if (!takeoverState?.active) return;
 
-  // Block echo
-  const msgSid = req.body?.message?.id?.toString();
-  if (msgSid && await isBotMessage(msgSid)) {
-    console.log(`[Echo] Blocked bot echo for ${msgSid}`);
+  // Block echo of bot's own messages
+  if (msgId && await isBotMessage(msgId)) {
+    console.log(`[Echo] Blocked bot echo for ${msgId}`);
     return;
   }
 
@@ -712,7 +701,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.6 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.7 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.6 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.7 running on port ${PORT}`));
