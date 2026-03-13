@@ -233,6 +233,65 @@ function buildConversationSummary(messages) {
     .join('\n');
 }
 
+async function generateEmailSummary(messages) {
+  try {
+    const transcript = buildConversationSummary(messages);
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 120,
+        system: 'You are a freight logistics assistant. Write a single plain-text sentence (max 40 words) summarizing the shipment inquiry. Include commodity, origin, destination, and urgency if mentioned. No bullet points, no labels, no markdown.',
+        messages: [{ role: 'user', content: transcript }]
+      })
+    });
+    const data = await res.json();
+    return data?.content?.[0]?.text || null;
+  } catch (err) {
+    console.error('[Email] Summary generation failed:', err.message);
+    return null;
+  }
+}
+
+async function detectLanguageAck(detectedLang) {
+  const acks = {
+    es: 'Recibí tu archivo. Lo paso a nuestro equipo ahora.',
+    pt: 'Recebi seu arquivo. Vou encaminhá-lo para nossa equipe agora.',
+    de: 'Ich habe deine Datei erhalten. Ich leite sie jetzt an unser Team weiter.',
+    fr: 'J\'ai bien reçu ton fichier. Je le transmets à notre équipe maintenant.',
+    en: 'Got your file. Let me pass that along to our team.'
+  };
+  return acks[detectedLang] || acks['en'];
+}
+
+async function detectLanguage(text) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 5,
+        system: 'Detect the language of the text. Reply with only the 2-letter ISO code: en, es, pt, de, fr, or other.',
+        messages: [{ role: 'user', content: text }]
+      })
+    });
+    const data = await res.json();
+    return data?.content?.[0]?.text?.trim().toLowerCase() || 'en';
+  } catch {
+    return 'en';
+  }
+}
+
 // ─── Email alerts ──────────────────────────────────────────────────────────────
 async function sendEmailAlert(tier, phone, messageContent) {
   if (tier === 3) return;
@@ -253,6 +312,7 @@ async function sendEmailAlert(tier, phone, messageContent) {
     m.messages?.some(msg => msg.content?.includes(messageContent.slice(0, 30)))
   );
   const msgs = mem?.messages || [];
+  const summaryText = await generateEmailSummary(msgs) || messageContent;
 
   // Parse fields from conversation
   const fullText = msgs.map(m => m.content).join(' ').toLowerCase();
@@ -268,7 +328,7 @@ async function sendEmailAlert(tier, phone, messageContent) {
     const label  = isCustomer ? 'CLIENT' : 'ATW BOT';
     const color  = isCustomer ? '#0055A4' : '#007A33';
     return `<tr>
-      <td style="padding:6px 0;">
+      <td style="padding:6px 0;border-top:1px solid #f0f0f0;">
         <span style="font-weight:700;color:${color};font-size:13px;">${label}:</span>
         <span style="font-size:13px;color:#333;margin-left:6px;">${m.content}</span>
       </td>
@@ -276,63 +336,63 @@ async function sendEmailAlert(tier, phone, messageContent) {
   }).join('');
 
   const html = `<!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:30px 0;">
-    <tr><td align="center">
-      <table width="620" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:6px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="X-UA-Compatible" content="IE=edge"></head>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f4;padding:30px 0;">
+  <tr><td align="center" style="padding:0 15px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:640px;background:#ffffff;border-radius:6px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
 
-        <!-- Header -->
-        <tr><td style="background:${accentColor};padding:20px 30px;">
-          <span style="font-size:20px;font-weight:700;color:#ffffff;letter-spacing:1px;">ATW CARGO</span>
-          <span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span>
-        </td></tr>
+      <!-- Header -->
+      <tr><td style="background:${accentColor};padding:20px 30px;">
+        <span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:1px;">ATW CARGO</span>
+        <span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span>
+      </td></tr>
 
-        <!-- Badge -->
-        <tr><td style="background:${badgeColor};padding:10px 30px;">
-          <span style="font-size:13px;font-weight:700;color:#ffffff;letter-spacing:1px;">${badgeText}</span>
-        </td></tr>
+      <!-- Badge -->
+      <tr><td style="background:${badgeColor};padding:10px 30px;">
+        <span style="font-size:13px;font-weight:700;color:#ffffff;letter-spacing:1px;">${badgeText}</span>
+      </td></tr>
 
-        <!-- Summary -->
-        <tr><td style="padding:24px 30px 8px;">
-          <p style="margin:0 0 16px;font-size:15px;color:#333;">${msgs.find(m=>m.role==='user')?.content || messageContent}</p>
-          <table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;">
-            <tr style="background:#f9f9f9;">
-              <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;">Client</td>
-              <td style="padding:10px 16px;font-size:13px;color:#333;">${cleanPhone}</td>
-            </tr>
-            <tr>
-              <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-top:1px solid #e0e0e0;">Origin</td>
-              <td style="padding:10px 16px;font-size:13px;color:#333;border-top:1px solid #e0e0e0;">${origin.toUpperCase()}</td>
-            </tr>
-            <tr style="background:#f9f9f9;">
-              <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-top:1px solid #e0e0e0;">Destination</td>
-              <td style="padding:10px 16px;font-size:13px;color:#333;border-top:1px solid #e0e0e0;">${destination.toUpperCase()}</td>
-            </tr>
-            <tr>
-              <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-top:1px solid #e0e0e0;">Urgency</td>
-              <td style="padding:10px 16px;font-size:13px;color:#333;border-top:1px solid #e0e0e0;">${urgency}</td>
-            </tr>
-          </table>
-        </td></tr>
+      <!-- Summary -->
+      <tr><td style="padding:24px 30px 8px;">
+        <p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p>
+        <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;">
+          <tr style="background:#f9f9f9;">
+            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Client</td>
+            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td>
+            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td>
+          </tr>
+          <tr style="background:#f9f9f9;">
+            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td>
+            <td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td>
+            <td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td>
+          </tr>
+        </table>
+      </td></tr>
 
-        <!-- Conversation -->
-        <tr><td style="padding:20px 30px 8px;">
-          <p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p>
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #eee;">
-            ${convRows}
-          </table>
-        </td></tr>
+      <!-- Conversation -->
+      <tr><td style="padding:20px 30px 8px;">
+        <p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p>
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+          ${convRows}
+        </table>
+      </td></tr>
 
-        <!-- Footer -->
-        <tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;">
-          <span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span>
-        </td></tr>
+      <!-- Footer -->
+      <tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;">
+        <span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span>
+      </td></tr>
 
-      </table>
-    </td></tr>
-  </table>
+    </table>
+  </td></tr>
+</table>
 </body>
 </html>`;
 
@@ -547,8 +607,9 @@ app.post('/webhook', async (req, res) => {
     } catch (err) {
       console.error('[Attachment] Failed to forward to Chatwoot:', err.message);
     }
-    // Patty acknowledges attachment
-    const ack = 'Got your file. Let me pass that along to our team.';
+    // Patty acknowledges attachment in customer's language
+    const lang = await detectLanguage(text || 'hello');
+    const ack = await detectLanguageAck(lang);
     await sendWhatsApp(from, ack);
     if (chatwootConvId) await sendChatwootMessage(chatwootConvId, ack);
     return;
