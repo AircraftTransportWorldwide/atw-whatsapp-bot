@@ -1,28 +1,11 @@
 // ATW WhatsApp Bot v10.15
-// Changes from v10.14:
-// - Fixed Twenty InquiryFilterInput: personId → person.id.eq (relation filter syntax)
-// - Fixed Twenty InquiryCreateInput: personId → person.connect.id (relation connect syntax)
-// - Fixed Monday long_text column value: { text: } wrapper → plain string
-// - Removed primaryPhoneCountryCode from Twenty contact create (was causing errors with both '+1' and '1')
-// - Fixed Monday stale item ID bug: mondayItemId and twentyInquiryId reset on fresh session
-//   so bot never tries to update an inactive item from a previous Redis session
-// - Added Patty guardrail: must never promise follow-ups, flight details, or proactive outreach
-// - Email now waits for conversation to have enough substance before sending
-// - Fixed Monday column IDs to match real board schema (verified via MCP)
-// - Fixed Monday column value formats (status uses {label:}, long_text uses {text:})
-// - Fixed Twenty phone country code: '+1' → '1' (Twenty rejects the plus prefix)
-// - Fixed Patty ref number awareness: ref number is now injected into system prompt
-//   so Patty can answer "what's my reference number?" correctly mid-conversation
-// - Monday column map:
-//     Customer Name → "name" (item title, not a column value)
-//     Phone         → "text_mm1dj5cb"
-//     Tier          → "color_mm1dx2x3"  (status: "AOG Emergency" | "Freight Inquiry")
-//     Source        → "text_mm1d77a4"
-//     Reference     → "text_mm1dpm0d"
-//     Language      → "color_mm1dqhvs"  (status: "English" | "Spanish" | "Portuguese")
-//     Conversation  → "long_text_mm1d52b4"
-//     Status        → "status"           (labels: "Working on it" | "Done" | "Stuck")
-//     Date          → "date4"
+// Twenty: person relation filter + connect syntax fixed
+// Twenty: country code removed
+// Monday: long_text plain string, verified column IDs
+// Patty: ref number injected into system prompt
+// Patty: guardrail against promising follow-ups
+// Redis: 24hr TTL, stale CRM IDs cleared on fresh session
+// Email: waits for 3+ messages + 2 key fields before sending
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -38,18 +21,18 @@ app.use(express.json());
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// ─── Redis ─────────────────────────────────────────────────────────────────────
 const redis = createClient({ url: process.env.REDIS_URL });
 redis.on('error', err => console.error('[Redis] Error:', err));
 redis.on('connect', () => console.log('[Redis] Connected'));
 await redis.connect();
 
-// ─── Redis helpers ─────────────────────────────────────────────────────────────
 const MEMORY_TTL   = 24 * 60 * 60;
 const TAKEOVER_TTL = 3 * 60 * 60;
 const DEDUP_TTL    = 24 * 60 * 60;
 const RATE_TTL     = 10 * 60;
 const RATE_MAX     = 15;
+const MEMORY_LIMIT = 10;
+const TAKEOVER_RESUME = 2 * 60 * 60 * 1000;
 
 async function getMem(phone) {
   const raw = await redis.get(`mem:${phone}`);
@@ -101,21 +84,16 @@ async function isChatwootDuplicate(convId, content, msgId) {
   return false;
 }
 
-// ─── Config ────────────────────────────────────────────────────────────────────
-const CHATWOOT_URL      = process.env.CHATWOOT_API_URL;
-const CHATWOOT_TOKEN    = process.env.CHATWOOT_API_TOKEN;
-const CHATWOOT_ACCOUNT  = process.env.CHATWOOT_ACCOUNT_ID || '1';
-const CHATWOOT_INBOX    = process.env.CHATWOOT_INBOX_ID   || '4';
-const TWENTY_API_URL    = process.env.TWENTY_API_URL;
-const TWENTY_API_KEY    = process.env.TWENTY_API_KEY;
-const TWENTY_INQUIRY_ID = 'df1a6f78-8b1a-481d-b394-ed047cad32e4';
-const FROM_NUMBER       = process.env.TWILIO_WHATSAPP_NUMBER;
-const MONDAY_API_KEY    = process.env.MONDAY_API_KEY;
-const MONDAY_BOARD_ID   = process.env.MONDAY_BOARD_ID;
-const MEMORY_LIMIT      = 10;
-const TAKEOVER_RESUME   = 2 * 60 * 60 * 1000;
+const CHATWOOT_URL     = process.env.CHATWOOT_API_URL;
+const CHATWOOT_TOKEN   = process.env.CHATWOOT_API_TOKEN;
+const CHATWOOT_ACCOUNT = process.env.CHATWOOT_ACCOUNT_ID || '1';
+const CHATWOOT_INBOX   = process.env.CHATWOOT_INBOX_ID   || '4';
+const TWENTY_API_URL   = process.env.TWENTY_API_URL;
+const TWENTY_API_KEY   = process.env.TWENTY_API_KEY;
+const FROM_NUMBER      = process.env.TWILIO_WHATSAPP_NUMBER;
+const MONDAY_API_KEY   = process.env.MONDAY_API_KEY;
+const MONDAY_BOARD_ID  = process.env.MONDAY_BOARD_ID;
 
-// ─── Monday column IDs (verified March 13 2026) ────────────────────────────────
 const MONDAY_COLS = {
   phone:        'text_mm1dj5cb',
   tier:         'color_mm1dx2x3',
@@ -127,7 +105,6 @@ const MONDAY_COLS = {
   date:         'date4'
 };
 
-// ─── Reference number ──────────────────────────────────────────────────────────
 function generateRefNumber() {
   const now  = new Date();
   const yy   = String(now.getFullYear()).slice(2);
@@ -137,13 +114,11 @@ function generateRefNumber() {
   return `ATW-${yy}${mm}${dd}-${rand}`;
 }
 
-// ─── Patty system prompt ───────────────────────────────────────────────────────
 function buildSystemPrompt(customerName, inquiryHistory, refNumber) {
   let contextBlock = '';
-
   if (customerName && inquiryHistory?.length > 0) {
-    const last = inquiryHistory[0];
-    const date = new Date(last.createdAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    const last   = inquiryHistory[0];
+    const date   = new Date(last.createdAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
     const wasAOG = inquiryHistory.some(i => i.tier === 'AOG_EMERGENCY');
     contextBlock = `You already know this customer. Their name is ${customerName}. They have contacted ATW ${inquiryHistory.length} time(s) before. Their most recent inquiry was in ${date}${last.commodity ? ' regarding ' + last.commodity : ''}${last.origin ? ' from ' + last.origin : ''}${last.destination ? ' to ' + last.destination : ''}.${wasAOG ? ' They have had at least one AOG emergency with ATW before.' : ''} Greet them warmly by name, briefly acknowledge their history with ATW, and ask how you can help today. Keep it natural — like a personal account manager who remembers their clients.`;
   } else if (customerName) {
@@ -185,7 +160,6 @@ GUARDRAILS:
 REFERENCE NUMBER: This inquiry has been assigned reference number ${refNumber}. If the customer asks for their reference or tracking number, give them this exact number: ${refNumber}.` : ''}`;
 }
 
-// ─── Twenty CRM ───────────────────────────────────────────────────────────────
 async function twentyQuery(query, variables = {}) {
   if (!TWENTY_API_URL || !TWENTY_API_KEY) return null;
   try {
@@ -203,9 +177,7 @@ async function twentyQuery(query, variables = {}) {
 async function findOrCreateContact(phone, name) {
   const cached = await getTwentyCache(phone);
   if (cached) return cached;
-
   const cleanPhone = phone.replace('whatsapp:', '');
-
   const searchResult = await twentyQuery(`
     query FindPeople($filter: PersonFilterInput) {
       people(filter: $filter) {
@@ -213,27 +185,24 @@ async function findOrCreateContact(phone, name) {
       }
     }
   `, { filter: { phones: { primaryPhoneNumber: { like: `%${cleanPhone}%` } } } });
-
   if (searchResult?.people?.edges?.length > 0) {
-    const person = searchResult.people.edges[0].node;
+    const person   = searchResult.people.edges[0].node;
     const fullName = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
-    const contact = { id: person.id, name: fullName || null };
+    const contact  = { id: person.id, name: fullName || null };
     await setTwentyCache(phone, contact);
     console.log(`[Twenty] Found contact: ${fullName || cleanPhone}`);
     return contact;
   }
-
   const createResult = await twentyQuery(`
     mutation CreatePeople($data: [PersonCreateInput!]) {
       createPeople(data: $data) { id name { firstName lastName } }
     }
   `, {
     data: [{
-      name: { firstName: name || 'WhatsApp', lastName: cleanPhone },
+      name:   { firstName: name || 'WhatsApp', lastName: cleanPhone },
       phones: { primaryPhoneNumber: cleanPhone }
     }]
   });
-
   if (createResult?.createPeople?.[0]) {
     const contact = { id: createResult.createPeople[0].id, name: null };
     await setTwentyCache(phone, contact);
@@ -246,46 +215,30 @@ async function findOrCreateContact(phone, name) {
 async function getInquiryHistory(contactId) {
   const result = await twentyQuery(`
     query GetInquiries($filter: InquiryFilterInput) {
-      inquiries(
-        filter: $filter,
-        orderBy: { createdAt: DescNullsLast },
-        first: 10
-      ) {
+      inquiries(filter: $filter, orderBy: { createdAt: DescNullsLast }, first: 10) {
         edges {
           node {
-            id
-            referenceNumber
-            tier
-            status
-            language
-            escalated
-            origin
-            destination
-            commodity
-            weightDims
-            createdAt
+            id referenceNumber tier status language escalated
+            origin destination commodity weightDims createdAt
           }
         }
       }
     }
-  `, { filter: { personId: { eq: contactId } } });
+  `, { filter: { person: { id: { eq: contactId } } } });
   return result?.inquiries?.edges?.map(e => e.node) || [];
 }
 
 async function createTwentyInquiry(contactId, phone, tier, mem) {
   if (!contactId) return null;
-  const cleanPhone = phone.replace('whatsapp:', '');
-  const tierValue  = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
-  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-
+  const cleanPhone  = phone.replace('whatsapp:', '');
+  const tierValue   = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
+  const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const fullText    = mem.messages.map(m => m.content).join(' ');
   const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
   const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
   const kgMatch     = fullText.match(/(\d+[\d.,]*\s*(?:kg|kgs|kilos|lbs|pounds))/i);
   const commMatch   = fullText.match(/(?:shipping|sending|cargo|freight|commodity|producto|mercancia|enviar)\s+([a-zA-Z\s]+?)(?:\.|,|\s+from|\s+de|$)/i);
-
-  const langMap = { en: 'EN', es: 'ES', pt: 'PT' };
-
+  const langMap     = { en: 'EN', es: 'ES', pt: 'PT' };
   const result = await twentyQuery(`
     mutation CreateInquiry($data: InquiryCreateInput!) {
       createInquiry(data: $data) { id referenceNumber }
@@ -303,10 +256,9 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
       weightDims:      kgMatch?.[1]?.trim() || '',
       customerPhone:   cleanPhone,
       transcript:      transcript,
-      personId:        contactId,
+      person:          { connect: { id: contactId } }
     }
   });
-
   if (result?.createInquiry) {
     console.log(`[Twenty] Created inquiry: ${result.createInquiry.id} (${mem.refNumber})`);
     return result.createInquiry.id;
@@ -324,36 +276,19 @@ async function updateTwentyInquiry(inquiryId, updates) {
   if (result?.updateInquiry) console.log(`[Twenty] Updated inquiry: ${inquiryId}`);
 }
 
-async function postContactNote(contactId, phone, refNumber, summary) {
-  if (!contactId) return;
-  const cleanPhone = phone.replace('whatsapp:', '');
-  await twentyQuery(`
-    mutation CreateNote($input: CreateNoteInput!) { createNote(input: $input) { id } }
-  `, {
-    input: {
-      title: `WhatsApp Inquiry ${refNumber} — ${cleanPhone}`,
-      body:  summary,
-      noteTargets: [{ targetObjectNameSingular: 'person', id: contactId }]
-    }
-  });
-  console.log(`[Twenty] Note posted for contact ${contactId}`);
-}
-
 async function postChatwootProfileNote(chatwootConvId, contact, phone, inquiryHistory) {
   if (!chatwootConvId) return;
   const cleanPhone = phone.replace('whatsapp:', '');
   const twentyUrl  = `${TWENTY_API_URL}/objects/inquiries`;
-  const lines = ['📋 CUSTOMER PROFILE — Twenty CRM', `Phone: ${cleanPhone}`];
-
-  if (contact.name) { lines.push(`Name: ${contact.name}`); }
-  else { lines.push(`Name: Unknown (new contact)`); }
-
+  const lines      = ['CUSTOMER PROFILE — Twenty CRM', `Phone: ${cleanPhone}`];
+  if (contact.name) lines.push(`Name: ${contact.name}`);
+  else lines.push('Name: Unknown (new contact)');
   if (inquiryHistory.length > 0) {
     const aogCount = inquiryHistory.filter(i => i.tier === 'AOG_EMERGENCY').length;
     lines.push(`Past inquiries: ${inquiryHistory.length}${aogCount > 0 ? ` (${aogCount} AOG)` : ''}`);
     const last = inquiryHistory[0];
     const date = new Date(last.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    lines.push(`Last inquiry: ${last.referenceNumber || '—'} on ${date}`);
+    lines.push(`Last inquiry: ${last.referenceNumber || '---'} on ${date}`);
     if (last.commodity)   lines.push(`Commodity: ${last.commodity}`);
     if (last.origin)      lines.push(`Origin: ${last.origin}`);
     if (last.destination) lines.push(`Destination: ${last.destination}`);
@@ -361,13 +296,11 @@ async function postChatwootProfileNote(chatwootConvId, contact, phone, inquiryHi
     lines.push('Past inquiries: 0');
     lines.push('Status: First contact');
   }
-
-  lines.push(`View in Twenty → ${twentyUrl}`);
+  lines.push(`View in Twenty: ${twentyUrl}`);
   await sendChatwootMessage(chatwootConvId, lines.join('\n'), 'outgoing', true);
   console.log(`[Chatwoot] Posted profile note for ${cleanPhone}`);
 }
 
-// ─── Monday CRM ────────────────────────────────────────────────────────────────
 async function mondayQuery(query, variables = {}) {
   if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
   try {
@@ -384,16 +317,15 @@ async function mondayQuery(query, variables = {}) {
 
 async function createMondayItem(phone, tier, mem) {
   if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
-  const cleanPhone  = phone.replace('whatsapp:', '');
-  const tierLabel   = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
-  const langLabel   = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
-  const itemName    = mem.refNumber
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
+  const langLabel  = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
+  const itemName   = mem.refNumber
     ? `${mem.refNumber} — ${mem.customerName || cleanPhone}`
     : (mem.customerName || cleanPhone);
-  const today       = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-  const now         = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-
+  const today      = new Date().toISOString().split('T')[0];
+  const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const columnValues = JSON.stringify({
     [MONDAY_COLS.phone]:        cleanPhone,
     [MONDAY_COLS.reference]:    mem.refNumber || '',
@@ -402,9 +334,8 @@ async function createMondayItem(phone, tier, mem) {
     [MONDAY_COLS.source]:       'WhatsApp Bot',
     [MONDAY_COLS.status]:       { label: 'Working on it' },
     [MONDAY_COLS.date]:         { date: today },
-    [MONDAY_COLS.conversation]: { text: `[${now} ET — bot handled]\n\n${transcript}` }
+    [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}`
   });
-
   const result = await mondayQuery(
     `mutation CreateItem($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
       create_item(board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id }
@@ -421,7 +352,7 @@ async function updateMondayItem(itemId, phone, mem, finalTranscript) {
   const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   await mondayQuery(
     `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
-    { itemId, body: `✅ Conversation closed — ${now} ET\n\n${finalTranscript}` }
+    { itemId, body: `Conversation closed — ${now} ET\n\n${finalTranscript}` }
   );
   await mondayQuery(
     `mutation UpdateStatus($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
@@ -432,7 +363,6 @@ async function updateMondayItem(itemId, phone, mem, finalTranscript) {
   console.log(`[Monday] Updated item ${itemId} with final transcript`);
 }
 
-// ─── Language helpers ──────────────────────────────────────────────────────────
 async function detectLanguage(text) {
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -447,32 +377,25 @@ async function detectLanguage(text) {
 
 function getAttachmentAck(lang) {
   const acks = {
-    es: 'Recibí tu archivo. Lo paso a nuestro equipo ahora.',
-    pt: 'Recebi seu arquivo. Vou encaminhá-lo para nossa equipe agora.',
-    de: 'Ich habe deine Datei erhalten. Ich leite sie jetzt an unser Team weiter.',
-    fr: 'J\'ai bien reçu ton fichier. Je le transmets à notre équipe maintenant.',
+    es: 'Recibi tu archivo. Lo paso a nuestro equipo ahora.',
+    pt: 'Recebi seu arquivo. Vou encaminha-lo para nossa equipe agora.',
     en: 'Got your file. Let me pass that along to our team.'
   };
   return acks[lang] || acks['en'];
 }
 
-// ─── Email readiness check ─────────────────────────────────────────────────────
 function isEmailReady(messages) {
   const customerMessages = messages.filter(m => m.role === 'user');
   if (customerMessages.length < 3) return false;
-
   const fullText = customerMessages.map(m => m.content).join(' ').toLowerCase();
   let fieldsFound = 0;
-
   if (/from\s+[a-zA-Z]/.test(fullText) || /\b(mia|miami|jfk|lax|ord|lhr|cdg|ams|dxb|nbo|bog|gru|mex)\b/.test(fullText)) fieldsFound++;
-  if (/\bto\b.{1,30}(airport|city|country)|\b(london|heathrow|lhr|paris|dubai|tokyo|bogota|sao paulo|nairobi)\b/.test(fullText) || /(?:to|hacia|para)\s+[a-zA-Z]/.test(fullText)) fieldsFound++;
-  if (/\d+\s*(kg|kgs|kilos|lbs|pounds)|part\s*(number|#|no)?[\s:]*[a-zA-Z0-9\-]{5,}|hydraulic|pump|engine|avionics|component|gear|actuator|sensor/.test(fullText)) fieldsFound++;
+  if (/\b(london|heathrow|lhr|paris|dubai|tokyo|bogota|nairobi)\b/.test(fullText) || /(?:to|hacia|para)\s+[a-zA-Z]/.test(fullText)) fieldsFound++;
+  if (/\d+\s*(kg|kgs|kilos|lbs|pounds)|part\s*(number|#|no)?[\s:]*[a-zA-Z0-9-]{5,}|hydraulic|pump|engine|avionics|gear|actuator|sensor/.test(fullText)) fieldsFound++;
   if (/\d+\s*x\s*\d+|\bdimensions?\b|\bweight\b|\bkg\b|\blbs\b/.test(fullText)) fieldsFound++;
-
   return fieldsFound >= 2;
 }
 
-// ─── Email alert ───────────────────────────────────────────────────────────────
 async function generateEmailSummary(messages) {
   try {
     const transcript = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -490,7 +413,7 @@ async function sendEmailAlert(tier, phone, messages, refNumber) {
   if (tier === 3) return;
   const cleanPhone  = phone.replace('whatsapp:', '');
   const isAOG       = tier === 1;
-  const ref         = refNumber || '—';
+  const ref         = refNumber || '---';
   const subject     = isAOG
     ? `AOG EMERGENCY [${ref}] — WhatsApp Inquiry from ${cleanPhone}`
     : `New Shipment Inquiry [${ref}] — WhatsApp from ${cleanPhone}`;
@@ -502,39 +425,19 @@ async function sendEmailAlert(tier, phone, messages, refNumber) {
   const fullText    = messages.map(m => m.content).join(' ');
   const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
   const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
-  const origin      = originMatch?.[1]?.trim() || '—';
-  const destination = destMatch?.[1]?.trim() || '—';
+  const origin      = originMatch?.[1]?.trim() || '---';
+  const destination = destMatch?.[1]?.trim() || '---';
   const convRows    = messages.map(m => {
-    const isCustomer = m.role === 'user';
-    return `<tr><td style="padding:6px 0;border-top:1px solid #f0f0f0;"><span style="font-weight:700;color:${isCustomer ? '#0055A4' : '#007A33'};font-size:13px;">${isCustomer ? 'CLIENT' : 'ATW BOT'}:</span><span style="font-size:13px;color:#333;margin-left:6px;">${m.content}</span></td></tr>`;
+    const isCust = m.role === 'user';
+    return `<tr><td style="padding:6px 0;border-top:1px solid #f0f0f0;"><span style="font-weight:700;color:${isCust ? '#0055A4' : '#007A33'};font-size:13px;">${isCust ? 'CLIENT' : 'ATW BOT'}:</span><span style="font-size:13px;color:#333;margin-left:6px;">${m.content}</span></td></tr>`;
   }).join('');
-
-  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:30px 0;">
-<tr><td align="center"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
-<tr><td style="background:${accentColor};padding:20px 30px;"><span style="font-size:22px;font-weight:700;color:#fff;letter-spacing:1px;">ATW CARGO</span><span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span></td></tr>
-<tr><td style="background:${badgeColor};padding:10px 30px;"><span style="font-size:13px;font-weight:700;color:#fff;letter-spacing:1px;">${badgeText}</span></td></tr>
-<tr><td style="padding:24px 30px 8px;">
-<p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p>
-<table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;">
-<tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Reference</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${ref}</td></tr>
-<tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Client</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr>
-<tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td></tr>
-<tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr>
-<tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td></tr>
-</table></td></tr>
-<tr><td style="padding:20px 30px 8px;"><p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p>
-<table width="100%" cellpadding="0" cellspacing="0">${convRows}</table></td></tr>
-<tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;"><span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span></td></tr>
-</table></td></tr></table></body></html>`;
-
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:30px 0;"><tr><td align="center"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.08);"><tr><td style="background:${accentColor};padding:20px 30px;"><span style="font-size:22px;font-weight:700;color:#fff;letter-spacing:1px;">ATW CARGO</span><span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span></td></tr><tr><td style="background:${badgeColor};padding:10px 30px;"><span style="font-size:13px;font-weight:700;color:#fff;letter-spacing:1px;">${badgeText}</span></td></tr><tr><td style="padding:24px 30px 8px;"><p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p><table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;"><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Reference</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${ref}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Client</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td></tr></table></td></tr><tr><td style="padding:20px 30px 8px;"><p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p><table width="100%" cellpadding="0" cellspacing="0">${convRows}</table></td></tr><tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;"><span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span></td></tr></table></td></tr></table></body></html>`;
   try {
     await resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html });
     console.log(`[Email] Tier ${tier} alert sent (${ref})`);
   } catch (err) { console.error('[Email] Failed:', err.message); }
 }
 
-// ─── Tier classifier ───────────────────────────────────────────────────────────
 function classifyTier(text) {
   const t = text.toLowerCase();
   if (/aog|aircraft on ground|grounded|plane down|emergency|emergencia/.test(t)) return 1;
@@ -542,7 +445,6 @@ function classifyTier(text) {
   return 3;
 }
 
-// ─── Claude API ────────────────────────────────────────────────────────────────
 async function callClaude(messages, systemPrompt) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -553,7 +455,6 @@ async function callClaude(messages, systemPrompt) {
   return data?.content?.[0]?.text || null;
 }
 
-// ─── Chatwoot helpers ──────────────────────────────────────────────────────────
 async function findOrCreateChatwootContact(phone, name) {
   const cleanPhone = phone.replace('whatsapp:', '');
   try {
@@ -580,7 +481,7 @@ async function findOrCreateChatwootConversation(contactId) {
       { headers: { 'api_access_token': CHATWOOT_TOKEN } }
     );
     const data = await convs.json();
-    const open = data?.payload?.find(c => c.status === 'open' && c.inbox_id === parseInt(CHATWOOT_INBOX));
+    const open  = data?.payload?.find(c => c.status === 'open' && c.inbox_id === parseInt(CHATWOOT_INBOX));
     if (open) return open.id;
     const create = await fetch(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT}/conversations`, {
       method: 'POST',
@@ -602,7 +503,6 @@ async function sendChatwootMessage(convId, content, type = 'outgoing', isPrivate
   } catch (err) { console.error('[Chatwoot] Message error:', err.message); }
 }
 
-// ─── Twilio send ───────────────────────────────────────────────────────────────
 async function sendWhatsApp(to, body) {
   const msg = await twilioClient.messages.create({ from: FROM_NUMBER, to, body });
   await markBotMessage(msg.sid);
@@ -610,7 +510,6 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
-// ─── Main webhook — inbound from Twilio ───────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send('<Response></Response>');
@@ -633,53 +532,42 @@ app.post('/webhook', async (req, res) => {
     language: 'en', highestTier: 3,
     refNumber: null, refSentToCustomer: false
   };
-  // Reset CRM item IDs on fresh session so we never update a stale/inactive item
   if (isFirstMessage) {
-    mem.mondayItemId    = null;
-    mem.twentyInquiryId = null;
-    mem.inquiryCreated  = false;
-    mem.emailSent       = false;
-    mem.refNumber       = null;
+    mem.mondayItemId      = null;
+    mem.twentyInquiryId   = null;
+    mem.inquiryCreated    = false;
+    mem.emailSent         = false;
+    mem.refNumber         = null;
     mem.refSentToCustomer = false;
-    mem.highestTier     = 3;
+    mem.highestTier       = 3;
   }
 
-  // ── Twenty: find or create contact ──
   let twentyContact = null;
   let inquiryHistory = [];
-  let isReturningCustomer = false;
   try {
     twentyContact = await findOrCreateContact(from, null);
     if (twentyContact) {
       mem.twentyContactId = twentyContact.id;
-      if (twentyContact.name && !mem.customerName) {
-        mem.customerName = twentyContact.name;
-      }
+      if (twentyContact.name && !mem.customerName) mem.customerName = twentyContact.name;
       inquiryHistory = await getInquiryHistory(twentyContact.id);
       if (inquiryHistory.length > 0) {
-        isReturningCustomer = true;
-        if (!mem.language || mem.language === 'en') {
-          const langMap = { EN: 'en', ES: 'es', PT: 'pt' };
-          mem.language = langMap[inquiryHistory[0].language] || 'en';
-        }
+        const langMap = { EN: 'en', ES: 'es', PT: 'pt' };
+        if (!mem.language || mem.language === 'en') mem.language = langMap[inquiryHistory[0].language] || 'en';
         console.log(`[Twenty] Returning customer with ${inquiryHistory.length} past inquiries`);
       }
     }
   } catch (err) { console.error('[Twenty] Contact lookup failed:', err.message); }
 
-  // ── Chatwoot contact + conversation ──
   const chatwootContactId = await findOrCreateChatwootContact(from, mem.customerName || from.replace('whatsapp:', ''));
   let chatwootConvId = null;
   if (chatwootContactId) chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId);
 
-  // ── Post profile note on first message ──
   if (isFirstMessage && twentyContact && chatwootConvId) {
     postChatwootProfileNote(chatwootConvId, twentyContact, from, inquiryHistory).catch(err =>
       console.error('[Twenty] Profile note failed:', err.message)
     );
   }
 
-  // ── Check agent takeover ──
   if (chatwootConvId) {
     const takeoverState = await getTakeover(chatwootConvId);
     if (takeoverState?.active) {
@@ -693,7 +581,6 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  // ── Handle attachment ──
   const hasMedia = parseInt(numMedia || '0') > 0;
   if (hasMedia && chatwootConvId) {
     try {
@@ -714,25 +601,19 @@ app.post('/webhook', async (req, res) => {
     const lang = await detectLanguage(recentText);
     mem.language = lang;
     await setMem(from, mem);
-    const ack = getAttachmentAck(lang);
-    await sendWhatsApp(from, ack);
-    await sendChatwootMessage(chatwootConvId, ack);
+    await sendWhatsApp(from, getAttachmentAck(lang));
+    await sendChatwootMessage(chatwootConvId, getAttachmentAck(lang));
     return;
   }
 
   if (!text) return;
-
-  // ── Mirror inbound to Chatwoot ──
   if (chatwootConvId) await sendChatwootMessage(chatwootConvId, text, 'incoming');
 
-  // ── Build history ──
   mem.messages.push({ role: 'user', content: text });
   if (mem.messages.length > MEMORY_LIMIT * 2) mem.messages = mem.messages.slice(-MEMORY_LIMIT * 2);
 
-  // ── Detect language ──
   try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
 
-  // ── Call Claude ──
   const systemPrompt = buildSystemPrompt(mem.customerName, isFirstMessage ? inquiryHistory : [], mem.refNumber);
   let reply;
   try {
@@ -746,28 +627,24 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'assistant', content: reply });
   await setMem(from, mem);
 
-  // ── Classify ──
-  const tier        = classifyTier(text);
-  const prevHighest = mem.highestTier || 3;
+  const tier         = classifyTier(text);
+  const prevHighest  = mem.highestTier || 3;
   const isEscalation = tier < prevHighest;
-  if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} → ${tier}`); }
+  if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
   else { console.log(`[Tier] ${tier} for: "${text}"`); }
 
-  // ── Generate ref number on first Tier 1/2 ──
   if ((tier === 1 || tier === 2) && !mem.refNumber) {
     mem.refNumber = generateRefNumber();
     console.log(`[Ref] Generated ${mem.refNumber}`);
   }
 
-  // ── Send reply (with ref number injected if needed — single message, never two) ──
   if (mem.refNumber && !mem.refSentToCustomer) {
     const langAck = {
-      es: `Tu número de referencia es ${mem.refNumber}. Guárdalo para cualquier seguimiento.`,
-      pt: `Seu número de referência é ${mem.refNumber}. Guarde-o para qualquer acompanhamento.`,
+      es: `Tu numero de referencia es ${mem.refNumber}. Guardalo para cualquier seguimiento.`,
+      pt: `Seu numero de referencia e ${mem.refNumber}. Guarde-o para qualquer acompanhamento.`,
       en: `I've logged your inquiry under reference number ${mem.refNumber}. Please keep this handy for any follow-up.`
     };
-    const refLine  = langAck[mem.language] || langAck['en'];
-    const refReply = `${reply}\n\n${refLine}`;
+    const refReply = `${reply}\n\n${langAck[mem.language] || langAck['en']}`;
     mem.refSentToCustomer = true;
     await sendWhatsApp(from, refReply);
     if (chatwootConvId) await sendChatwootMessage(chatwootConvId, refReply, 'outgoing');
@@ -778,14 +655,12 @@ app.post('/webhook', async (req, res) => {
 
   await setMem(from, mem);
 
-  // ── Email alert ──
   if ((tier === 1 || tier === 2) && (!mem.emailSent || isEscalation) && isEmailReady(mem.messages)) {
     await sendEmailAlert(tier, from, mem.messages, mem.refNumber);
     mem.emailSent = true;
     await setMem(from, mem);
   }
 
-  // ── Twenty Inquiry ──
   if ((tier === 1 || tier === 2) && mem.twentyContactId) {
     try {
       if (!mem.inquiryCreated) {
@@ -797,25 +672,19 @@ app.post('/webhook', async (req, res) => {
         }
       } else if (isEscalation && mem.twentyInquiryId) {
         const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-        await updateTwentyInquiry(mem.twentyInquiryId, {
-          tier:      'AOG_EMERGENCY',
-          escalated: true,
-          status:    'NEW',
-          transcript
-        });
+        await updateTwentyInquiry(mem.twentyInquiryId, { tier: 'AOG_EMERGENCY', escalated: true, status: 'NEW', transcript });
       }
     } catch (err) { console.error('[Twenty] Inquiry create/update failed:', err.message); }
   }
 
-  // ── Monday ──
   if (tier === 1 || tier === 2) {
     try {
       if (!mem.mondayItemId) {
         const itemId = await createMondayItem(from, tier, mem);
         if (itemId) { mem.mondayItemId = itemId; await setMem(from, mem); }
       } else if (isEscalation) {
-        const transcript   = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-        const escalationNote = `⚠️ ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${transcript}`;
+        const transcript     = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+        const escalationNote = `ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${transcript}`;
         await mondayQuery(
           `mutation UpdateItem($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
             change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
@@ -835,30 +704,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ─── Chatwoot webhook — agent replies ─────────────────────────────────────────
 app.post('/chatwoot-webhook', async (req, res) => {
   res.sendStatus(200);
-
   const { event, message_type, content, conversation, private: isPrivate, attachments } = req.body;
-
   if (isPrivate) return;
   if (event !== 'message_created' || message_type !== 'outgoing') return;
-
   const convId = conversation?.id;
   const meta   = conversation?.meta;
   const phone  = meta?.sender?.identifier || meta?.sender?.phone_number;
   if (!phone || !convId) return;
-
   const to    = phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
   const text  = (content || '').trim();
   const msgId = req.body?.message?.id?.toString();
+  if (await isChatwootDuplicate(convId, text, msgId)) { console.log(`[CW Dedup] Skipped duplicate for conv ${convId}`); return; }
 
-  if (await isChatwootDuplicate(convId, text, msgId)) {
-    console.log(`[CW Dedup] Skipped duplicate for conv ${convId}`);
-    return;
-  }
-
-  // ── #takeover ──
   if (text.toLowerCase() === '#takeover') {
     await setTakeover(convId, { active: true, lastAgentMessage: Date.now() });
     await sendChatwootMessage(convId, 'Bot is now paused. You have full control. Type #done to hand back.', 'outgoing', true);
@@ -866,22 +725,12 @@ app.post('/chatwoot-webhook', async (req, res) => {
     return;
   }
 
-  // ── #done ──
   if (text.toLowerCase() === '#done') {
     const mem = await getMem(to);
     if (mem) {
       const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-      if (mem.mondayItemId) {
-        updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err =>
-          console.error('[Monday] Final update failed:', err.message)
-        );
-      }
-      if (mem.twentyInquiryId) {
-        updateTwentyInquiry(mem.twentyInquiryId, {
-          status:     'CLOSED_AGENT',
-          transcript
-        }).catch(err => console.error('[Twenty] #done update failed:', err.message));
-      }
+      if (mem.mondayItemId) updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err => console.error('[Monday] Final update failed:', err.message));
+      if (mem.twentyInquiryId) updateTwentyInquiry(mem.twentyInquiryId, { status: 'CLOSED_AGENT', transcript }).catch(err => console.error('[Twenty] #done update failed:', err.message));
     }
     await delTakeover(convId);
     await sendChatwootMessage(convId, 'Bot has resumed.', 'outgoing', true);
@@ -891,17 +740,10 @@ app.post('/chatwoot-webhook', async (req, res) => {
 
   const takeoverState = await getTakeover(convId);
   if (!takeoverState?.active) return;
-
-  if (msgId && await isBotMessage(msgId)) {
-    console.log(`[Echo] Blocked bot echo for ${msgId}`);
-    return;
-  }
-
+  if (msgId && await isBotMessage(msgId)) { console.log(`[Echo] Blocked bot echo for ${msgId}`); return; }
   takeoverState.lastAgentMessage = Date.now();
   await setTakeover(convId, takeoverState);
-
   if (text) { await sendWhatsApp(to, text); return; }
-
   if (attachments?.length > 0) {
     for (const att of attachments) {
       if (!att.data_url) continue;
@@ -912,7 +754,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-// ─── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.15 — online'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.15 running on port ${PORT}`));
