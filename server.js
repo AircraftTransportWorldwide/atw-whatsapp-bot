@@ -40,16 +40,25 @@ const RATE_WINDOW       = 10 * 60 * 1000;        // 10 minutes
 const RATE_MAX          = 15;
 
 // ─── Patty System Prompt ───────────────────────────────────────────────────────
-function buildSystemPrompt(customerName) {
-  const nameIntro = customerName
-    ? `You already know this customer — their name is ${customerName}. Greet them by name naturally.`
-    : '';
+function buildSystemPrompt(customerName, twentyHistory) {
+  let contextBlock = '';
 
-  return `You are Patty, a freight logistics assistant for ATW (Aircraft Transport Worldwide), a premium freight forwarder based in Miami. ATW specializes in AOG (Aircraft On Ground) emergencies, dangerous goods, oversized cargo, and international air and ocean freight.
+  if (customerName && twentyHistory?.length > 0) {
+    const lastNote = twentyHistory[0];
+    const date = new Date(lastNote.createdAt).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    const detail = lastNote.body?.split('\n').find(l => l.trim() && !l.startsWith('Customer:') && !l.startsWith('Patty:') && !l.includes('WhatsApp'));
+    contextBlock = `You already know this customer. Their name is ${customerName}. They have contacted ATW ${twentyHistory.length} time(s) before. Their most recent inquiry was in ${date}${detail ? ': ' + detail.trim() : ''}. Greet them warmly by name, briefly acknowledge their history with ATW, and ask how you can help today. Keep it natural and human — like a personal account manager who remembers their clients.`;
+  } else if (customerName) {
+    contextBlock = `You already know this customer. Their name is ${customerName}. Greet them warmly by name and ask how you can help today.`;
+  } else {
+    contextBlock = `This is a new customer. Use the standard greeting below.`;
+  }
 
-${nameIntro}
+  return `You are Patty, a freight logistics assistant for ATW (Aircraft Transport Worldwide), a premium freight forwarder based in Miami. ATW specializes in AOG (Aircraft On Ground) emergencies, dangerous goods, oversized cargo, and international air and ocean freight. ATW is a premium, personal service — clients should always feel like they have a dedicated account manager, not a chatbot.
 
-GREETING (use only on first message):
+${contextBlock}
+
+GREETING (use only for new customers with no history):
 "Hi, I'm Patty from ATW. We handle everything from AOG emergencies to complex international freight — always with the urgency and care your shipment deserves. What can I do for you today?"
 
 YOUR JOB:
@@ -107,6 +116,68 @@ async function twentyQuery(query, variables = {}) {
     console.error('[Twenty] Request failed:', err.message);
     return null;
   }
+}
+
+async function getTwentyContactHistory(contactId) {
+  // Get past notes/inquiries for this contact
+  const result = await twentyQuery(`
+    query GetNotes($filter: NoteFilterInput) {
+      notes(filter: $filter, orderBy: { createdAt: DescNullsLast }, first: 5) {
+        edges {
+          node {
+            id
+            title
+            body
+            createdAt
+          }
+        }
+      }
+    }
+  `, {
+    filter: { noteTargets: { targetObjectId: { eq: contactId } } }
+  });
+  return result?.notes?.edges?.map(e => e.node) || [];
+}
+
+async function postChatwootProfileNote(chatwootConvId, contact, phone, isReturning) {
+  if (!chatwootConvId) return;
+
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const twentyUrl = `${TWENTY_API_URL}/objects/people/${contact.id}`;
+
+  let lines = [];
+  lines.push(`📋 CUSTOMER PROFILE — Twenty CRM`);
+  lines.push(`Phone: ${cleanPhone}`);
+
+  if (isReturning && contact.name) {
+    lines.push(`Name: ${contact.name}`);
+  } else {
+    lines.push(`Name: Unknown (new contact)`);
+  }
+
+  // Fetch past notes
+  const notes = await getTwentyContactHistory(contact.id);
+  if (notes.length > 0) {
+    lines.push(`Past WhatsApp inquiries: ${notes.length}`);
+    const last = notes[0];
+    const date = new Date(last.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    lines.push(`Last inquiry: ${last.title || 'Unknown'} (${date})`);
+
+    // Extract a one-liner from the note body if available
+    if (last.body) {
+      const firstLine = last.body.split('\n').find(l => l.trim() && !l.startsWith('Customer:') && !l.startsWith('Patty:') && !l.includes('WhatsApp'));
+      if (firstLine) lines.push(`Details: ${firstLine.trim()}`);
+    }
+  } else {
+    lines.push(`Past WhatsApp inquiries: 0`);
+    lines.push(`Status: First contact`);
+  }
+
+  lines.push(`View in Twenty → ${twentyUrl}`);
+
+  const noteContent = lines.join('\n');
+  await sendChatwootMessage(chatwootConvId, noteContent, 'outgoing', true);
+  console.log(`[Chatwoot] Posted profile note for ${cleanPhone}`);
 }
 
 async function findOrCreateContact(phone, name) {
@@ -551,12 +622,14 @@ app.post('/webhook', async (req, res) => {
 
   // ── Twenty: find or create contact ──
   let twentyContact = null;
+  let isReturningCustomer = false;
   try {
     twentyContact = await findOrCreateContact(from, null);
     if (twentyContact) {
       mem.twentyContactId = twentyContact.id;
       if (twentyContact.name && !mem.customerName) {
         mem.customerName = twentyContact.name;
+        isReturningCustomer = true;
         console.log(`[Twenty] Returning customer: ${mem.customerName}`);
       }
     }
@@ -569,6 +642,14 @@ app.post('/webhook', async (req, res) => {
   let chatwootConvId = null;
   if (chatwootContactId) {
     chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId, from);
+  }
+
+  // ── Post Twenty profile note on first message of conversation ──
+  const isFirstMessage = mem.messages.length === 0;
+  if (isFirstMessage && twentyContact && chatwootConvId) {
+    postChatwootProfileNote(chatwootConvId, twentyContact, from, isReturningCustomer).catch(err =>
+      console.error('[Twenty] Profile note failed:', err.message)
+    );
   }
 
   // ── Check agent takeover ──
@@ -630,8 +711,18 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'user', content: text });
   if (mem.messages.length > MEMORY_LIMIT * 2) mem.messages = mem.messages.slice(-MEMORY_LIMIT * 2);
 
+  // ── Fetch Twenty history for personalized greeting ──
+  let twentyHistory = [];
+  if (twentyContact?.id && isFirstMessage) {
+    try {
+      twentyHistory = await getTwentyContactHistory(twentyContact.id);
+    } catch (err) {
+      console.error('[Twenty] History fetch failed:', err.message);
+    }
+  }
+
   // ── Call Claude ──
-  const systemPrompt = buildSystemPrompt(mem.customerName);
+  const systemPrompt = buildSystemPrompt(mem.customerName, isFirstMessage ? twentyHistory : []);
   let reply;
   try {
     reply = await callClaude(mem.messages, systemPrompt);
