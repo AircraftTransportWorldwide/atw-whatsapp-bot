@@ -210,7 +210,7 @@ async function findOrCreateContact(phone, name) {
 
 async function getInquiryHistory(contactId) {
   const result = await twentyQuery(`
-    query GetInquiries($filter: InquiryFilter) {
+    query GetInquiries($filter: InquiryFilterInput) {
       inquiries(
         filter: $filter,
         orderBy: { createdAt: DescNullsLast },
