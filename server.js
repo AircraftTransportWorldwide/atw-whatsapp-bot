@@ -1,7 +1,8 @@
-// ATW WhatsApp Bot v10.9.1
-// Changes from v10.9:
-// - Fixed Twenty GraphQL mutations: createPerson→createPeople, input→data, updatePerson→updatePeople
-// - Fixed Twenty queries: PersonFilterInput→PersonFilter, CreatePersonInput removed
+// ATW WhatsApp Bot v10.9.2
+// Changes from v10.9.1:
+// - Fixed Twenty query filter: PersonFilter → PersonFilterInput (correct for v0.60.7)
+// - Fixed Twenty create: PersonCreateInput must be wrapped in array [PersonCreateInput!]
+// - Fixed Twenty create: createPeople returns array, access result as [0]
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -171,7 +172,7 @@ async function findOrCreateContact(phone, name) {
   const cleanPhone = phone.replace('whatsapp:', '');
 
   const searchResult = await twentyQuery(`
-    query FindPeople($filter: PersonFilter) {
+    query FindPeople($filter: PersonFilterInput) {
       people(filter: $filter) {
         edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } }
       }
@@ -188,20 +189,20 @@ async function findOrCreateContact(phone, name) {
   }
 
   const createResult = await twentyQuery(`
-    mutation CreatePeople($data: PersonCreateInput!) {
+    mutation CreatePeople($data: [PersonCreateInput!]) {
       createPeople(data: $data) { id name { firstName lastName } }
     }
   `, {
-    data: {
+    data: [{
       name: { firstName: name || 'WhatsApp', lastName: cleanPhone },
       phones: { primaryPhoneNumber: cleanPhone, primaryPhoneCountryCode: '+1' }
-    }
+    }]
   });
 
-  if (createResult?.createPeople) {
-    const contact = { id: createResult.createPeople.id, name: null };
+  if (createResult?.createPeople?.[0]) {
+    const contact = { id: createResult.createPeople[0].id, name: null };
     await setTwentyCache(phone, contact);
-    console.log(`[Twenty] Created contact: ${createResult.createPeople.id}`);
+    console.log(`[Twenty] Created contact: ${createResult.createPeople[0].id}`);
     return contact;
   }
   return null;
@@ -845,7 +846,7 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9.1 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.9.2 — online'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9.1 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.9.2 running on port ${PORT}`));
