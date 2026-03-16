@@ -1,9 +1,13 @@
-// ATW WhatsApp Bot v10.27
-// Changes from v10.26:
-// - findOrCreateContact: always queries Twenty first, never relies solely on Redis cache
-//   Prevents duplicate contacts after Redis flush
-// - classifyTier: negation-aware — "not AOG", "no emergency", "not urgent" no longer trigger Tier 1
-// - All v10.26 features included: effectiveTier, live agent, attachments, returning customer
+// ATW WhatsApp Bot v10.28
+// Changes from v10.27:
+// - Twenty duplicate contact fix: search by last 10 digits to match any phone formatting
+// - Monday item rename: uses change_multiple_column_values with "name" column (correct API)
+// - Twilio signature validation on /webhook (security)
+// - Input sanitization: strip HTML, limit to 1000 chars
+// - Retry wrapper on Twenty, Monday, and email critical calls
+// - Removed Monday raw response logging (production noise)
+// - Claude-based tier classification (replaces regex, handles negation + multilingual)
+// - Removed /flush-redis endpoint (security — use Railway Redis CLI instead)
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -110,6 +114,22 @@ function generateRefNumber() {
   return `ATW-${yy}${mm}${dd}-${rand}`;
 }
 
+// ─── Retry wrapper ─────────────────────────────────────────────────────────────
+async function withRetry(fn, retries = 3, delayMs = 500) {
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+}
+
+// ─── Input sanitization ────────────────────────────────────────────────────────
+function sanitizeInput(text) {
+  return (text || '').trim().slice(0, 1000).replace(/<[^>]*>/g, '');
+}
+
 async function extractFields(messages) {
   try {
     const transcript = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -167,18 +187,38 @@ async function detectLiveAgentRequest(text) {
   } catch { return false; }
 }
 
-function bestName(mem, fields, cleanPhone) {
-  return fields?.companyName || fields?.contactName || mem.customerName || mem.profileName || cleanPhone;
+// ✅ Claude-based tier classification — handles negation + multilingual
+async function classifyTierClaude(text) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 5,
+        system: `Classify this freight inquiry message into one of three tiers. Reply with only the number 1, 2, or 3.
+Tier 1 = AOG emergency: aircraft on ground, grounded plane, critical aviation emergency, needs parts immediately to get aircraft flying
+Tier 2 = Standard freight: shipping cargo, freight quote, delivery, package, dangerous goods, oversized cargo — any real shipment need
+Tier 3 = General: greetings, questions, thanks, unrelated topics, or anything not clearly a freight request
+Important: "not AOG", "not an emergency", "no emergency" = Tier 2 or 3, never Tier 1`,
+        messages: [{ role: 'user', content: text }]
+      })
+    });
+    const data = await res.json();
+    const t = parseInt(data?.content?.[0]?.text?.trim());
+    return [1, 2, 3].includes(t) ? t : 3;
+  } catch {
+    // Fallback to regex if Claude fails
+    const t = text.toLowerCase();
+    const negated = /\b(not|no|sin|sem)\s+(an?\s+)?(aog|emergency|emergencia|urgent|urgente)\b/i.test(t);
+    if (!negated && /\baog\b|aircraft on ground|grounded|plane down|\bemergency\b|\bemergencia\b/.test(t)) return 1;
+    if (/shipment|cargo|freight|quote|ship|send|enviar|carga|flete|kg|lbs|dimensions/.test(t)) return 2;
+    return 3;
+  }
 }
 
-// ✅ Negation-aware tier classifier
-function classifyTier(text) {
-  const t = text.toLowerCase();
-  // Strip negated AOG phrases before checking
-  const negatedAOG = /\b(not|no|non|sin|sem)\s+(an?\s+)?(aog|emergency|emergencia|emergencia|urgent|urgente)\b/i.test(t);
-  if (!negatedAOG && /\baog\b|aircraft on ground|grounded|plane down|\bemergency\b|\bemergencia\b/.test(t)) return 1;
-  if (/shipment|cargo|freight|quote|rate|delivery|pickup|package|paquete|enviar|envio|carga|flete|ship|send|dangerous goods|oversized|air freight|ocean freight|kilos|kg|lbs|pounds|dimensions/.test(t)) return 2;
-  return 3;
+function bestName(mem, fields, cleanPhone) {
+  return fields?.companyName || fields?.contactName || mem.customerName || mem.profileName || cleanPhone;
 }
 
 function buildSystemPrompt(customerName, inquiryHistory, refNumber) {
@@ -241,17 +281,20 @@ async function twentyQuery(query, variables = {}) {
   } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
-// ✅ Always queries Twenty directly — never creates duplicate contacts after Redis flush
+// ✅ Search by last 10 digits — matches any phone formatting Twenty might store
 async function findOrCreateContact(phone, name) {
   const cleanPhone = phone.replace('whatsapp:', '');
-  // Always search Twenty first regardless of cache
+  const digitsOnly = cleanPhone.replace(/\D/g, '');
+  const last10     = digitsOnly.slice(-10);
+
   const searchResult = await twentyQuery(`
     query FindPeople($filter: PersonFilterInput) {
       people(filter: $filter) {
         edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } }
       }
     }
-  `, { filter: { phones: { primaryPhoneNumber: { like: `%${cleanPhone}%` } } } });
+  `, { filter: { phones: { primaryPhoneNumber: { like: `%${last10}%` } } } });
+
   if (searchResult?.people?.edges?.length > 0) {
     const person        = searchResult.people.edges[0].node;
     const fullName      = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
@@ -261,8 +304,8 @@ async function findOrCreateContact(phone, name) {
     console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
   }
-  // Not found — create new
-  const createResult = await twentyQuery(`
+
+  const createResult = await withRetry(() => twentyQuery(`
     mutation CreatePeople($data: [PersonCreateInput!]) {
       createPeople(data: $data) { id name { firstName lastName } }
     }
@@ -271,7 +314,8 @@ async function findOrCreateContact(phone, name) {
       name:   { firstName: name || 'WhatsApp', lastName: cleanPhone },
       phones: { primaryPhoneNumber: cleanPhone }
     }]
-  });
+  }));
+
   if (createResult?.createPeople?.[0]) {
     const contact = { id: createResult.createPeople[0].id, name: null };
     await setTwentyCache(phone, contact);
@@ -304,7 +348,7 @@ async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const langMap    = { en: 'EN', es: 'ES', pt: 'PT' };
   const recordName = bestName(mem, fields, cleanPhone);
-  const result = await twentyQuery(`
+  const result = await withRetry(() => twentyQuery(`
     mutation CreateInquiry($data: InquiryCreateInput!) {
       createInquiry(data: $data) { id referenceNumber }
     }
@@ -324,7 +368,7 @@ async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
       transcript:      transcript,
       personId:        contactId
     }
-  });
+  }));
   if (result?.createInquiry) {
     console.log(`[Twenty] Created inquiry: ${result.createInquiry.id} (${mem.refNumber})`);
     return result.createInquiry.id;
@@ -365,22 +409,18 @@ async function enrichRecords(mem, phone, fields, isEscalation) {
       colUpdates[MONDAY_COLS.tier]   = { label: 'AOG Emergency' };
       colUpdates[MONDAY_COLS.status] = { label: 'Working on it' };
     }
+    // ✅ Rename item using "name" column via change_multiple_column_values
+    if (newName && mem.refNumber) {
+      colUpdates['name'] = `${mem.refNumber} — ${newName}`;
+    }
     await mondayQuery(
       `mutation UpdateItem($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
         change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
       }`,
       { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, columnValues: JSON.stringify(colUpdates) }
     );
-    if (newName && mem.refNumber) {
-      const newItemName = `${mem.refNumber} — ${newName}`;
-      await mondayQuery(
-        `mutation RenameItem($boardId: ID!, $itemId: ID!, $value: String!) {
-          change_simple_column_value(board_id: $boardId, item_id: $itemId, column_id: "name", value: $value) { id }
-        }`,
-        { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, value: newItemName }
-      );
-      console.log(`[Monday] Renamed item: ${newItemName}`);
-    }
+    if (newName && mem.refNumber) console.log(`[Monday] Renamed item: ${mem.refNumber} — ${newName}`);
+
     if (isEscalation) {
       await mondayQuery(
         `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
@@ -425,7 +465,6 @@ async function mondayQuery(query, variables = {}) {
       body: JSON.stringify({ query, variables })
     });
     const json = await res.json();
-    console.log('[Monday] Raw response:', JSON.stringify(json));
     if (json.errors) { console.error('[Monday] GraphQL errors:', JSON.stringify(json.errors)); return null; }
     return json.data;
   } catch (err) { console.error('[Monday] Request failed:', err.message); return null; }
@@ -451,12 +490,12 @@ async function createMondayItem(phone, tier, mem, fields) {
     [MONDAY_COLS.date]:         { date: today },
     [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}`
   });
-  const result = await mondayQuery(
+  const result = await withRetry(() => mondayQuery(
     `mutation CreateItem($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
       create_item(board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id }
     }`,
     { boardId: MONDAY_BOARD_ID, itemName, columnValues }
-  );
+  ));
   const itemId = result?.create_item?.id || null;
   if (itemId) console.log(`[Monday] Created item ${itemId} for ${cleanPhone}`);
   return itemId;
@@ -537,7 +576,7 @@ async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAg
   }).join('');
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:30px 0;"><tr><td align="center"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.08);"><tr><td style="background:${accentColor};padding:20px 30px;"><span style="font-size:22px;font-weight:700;color:#fff;letter-spacing:1px;">ATW CARGO</span><span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span></td></tr><tr><td style="background:${badgeColor};padding:10px 30px;"><span style="font-size:13px;font-weight:700;color:#fff;letter-spacing:1px;">${badgeText}</span></td></tr><tr><td style="padding:24px 30px 8px;"><p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p><table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;"><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Reference</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${ref}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Client</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td></tr></table></td></tr><tr><td style="padding:20px 30px 8px;"><p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p><table width="100%" cellpadding="0" cellspacing="0">${convRows}</table></td></tr><tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;"><span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span></td></tr></table></td></tr></table></body></html>`;
   try {
-    await resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html });
+    await withRetry(() => resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html }));
     console.log(`[Email] ${isLiveAgentRequest ? 'Live agent request' : `Tier ${tier}`} alert sent (${ref})`);
   } catch (err) { console.error('[Email] Failed:', err.message); }
 }
@@ -653,15 +692,15 @@ setInterval(async () => {
   } catch (err) { console.error('[Idle] Scanner error:', err.message); }
 }, SCAN_INTERVAL_MS);
 
-// ⚠️ REMOVE BEFORE LAUNCH
-app.get('/flush-redis', async (req, res) => {
-  await redis.flushAll();
-  res.send('Redis flushed OK');
-});
-
 app.post('/webhook', async (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send('<Response></Response>');
+
+  // ✅ Twilio signature validation
+  const twilioSig = req.headers['x-twilio-signature'];
+  const webhookUrl = `${process.env.WEBHOOK_BASE_URL || 'https://atw-whatsapp-bot-production.up.railway.app'}/webhook`;
+  const isValid = twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, twilioSig, webhookUrl, req.body);
+  if (!isValid) { console.warn('[Security] Invalid Twilio signature — request rejected'); return; }
 
   const {
     From: from, Body: body, MessageSid: sid,
@@ -672,7 +711,8 @@ app.post('/webhook', async (req, res) => {
   if (!from || !sid) return;
   if (await isDuplicate(sid)) { console.log(`[Dedup] Skipped ${sid}`); return; }
 
-  const text = (body || '').trim();
+  // ✅ Input sanitization
+  const text = sanitizeInput(body);
   console.log(`[Inbound] ${from}: ${text}`);
   if (await isRateLimited(from)) { console.log(`[RateLimit] Blocked ${from}`); return; }
 
@@ -702,7 +742,6 @@ app.post('/webhook', async (req, res) => {
     mem.liveAgentRequested = false;
   }
 
-  // ── Always fetch Twenty contact + history ──
   let twentyContact  = null;
   let inquiryHistory = [];
   try {
@@ -729,7 +768,7 @@ app.post('/webhook', async (req, res) => {
     );
   }
 
-  // ✅ Attachments: forward BEFORE takeover check
+  // ✅ Attachments before takeover check
   const hasMedia = parseInt(numMedia || '0') > 0;
   if (hasMedia && chatwootConvId) {
     await forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, text);
@@ -747,7 +786,6 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // ── Takeover check (text messages) ──
   if (chatwootConvId) {
     const takeoverState = await getTakeover(chatwootConvId);
     if (takeoverState?.active) {
@@ -813,11 +851,12 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'assistant', content: reply });
   await setMem(from, mem);
 
-  const tier         = classifyTier(text);
+  // ✅ Claude-based tier classification
+  const tier         = await classifyTierClaude(text);
   const prevHighest  = mem.highestTier || 3;
   const isEscalation = tier < prevHighest;
   if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
-  else { console.log(`[Tier] ${tier} for: "${text}"`); }
+  else { console.log(`[Tier] ${tier} for: "${text.slice(0, 60)}"`); }
 
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
 
@@ -929,6 +968,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.27 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.28 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.27 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.28 running on port ${PORT}`));
