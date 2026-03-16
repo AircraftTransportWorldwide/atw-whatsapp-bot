@@ -1,11 +1,7 @@
-// ATW WhatsApp Bot v10.15
-// Twenty: person relation filter + connect syntax fixed
-// Twenty: country code removed
-// Monday: long_text plain string, verified column IDs
-// Patty: ref number injected into system prompt
-// Patty: guardrail against promising follow-ups
-// Redis: 24hr TTL, stale CRM IDs cleared on fresh session
-// Email: waits for 3+ messages + 2 key fields before sending
+// ATW WhatsApp Bot v10.16
+// Twenty: fixed getInquiryHistory filter to use personId
+// Twenty: fixed createTwentyInquiry connect syntax
+// Monday: added raw response logging for debug
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -218,13 +214,13 @@ async function getInquiryHistory(contactId) {
       inquiries(filter: $filter, orderBy: { createdAt: DescNullsLast }, first: 10) {
         edges {
           node {
-            id referenceNumber tier status language escalated
+            id referenceNumber tier status language
             origin destination commodity weightDims createdAt
           }
         }
       }
     }
-  `, { filter: { person: { id: { eq: contactId } } } });
+  `, { filter: { personId: { eq: contactId } } });
   return result?.inquiries?.edges?.map(e => e.node) || [];
 }
 
@@ -256,7 +252,7 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
       weightDims:      kgMatch?.[1]?.trim() || '',
       customerPhone:   cleanPhone,
       transcript:      transcript,
-      person:          { connect: { id: contactId } }
+      personId:        contactId
     }
   });
   if (result?.createInquiry) {
@@ -310,6 +306,7 @@ async function mondayQuery(query, variables = {}) {
       body: JSON.stringify({ query, variables })
     });
     const json = await res.json();
+    console.log('[Monday] Raw response:', JSON.stringify(json));
     if (json.errors) { console.error('[Monday] GraphQL errors:', JSON.stringify(json.errors)); return null; }
     return json.data;
   } catch (err) { console.error('[Monday] Request failed:', err.message); return null; }
@@ -754,6 +751,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.15 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.16 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.15 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.16 running on port ${PORT}`));
