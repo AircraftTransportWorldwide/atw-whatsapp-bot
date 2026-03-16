@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.17
+// ATW WhatsApp Bot v10.18
 // Twenty: fixed getInquiryHistory filter to use personId
 // Twenty: fixed createTwentyInquiry connect syntax
 // Monday: added raw response logging for debug
@@ -235,12 +235,17 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
   const kgMatch     = fullText.match(/(\d+[\d.,]*\s*(?:kg|kgs|kilos|lbs|pounds))/i);
   const commMatch   = fullText.match(/(?:shipping|sending|cargo|freight|commodity|producto|mercancia|enviar)\s+([a-zA-Z\s]+?)(?:\.|,|\s+from|\s+de|$)/i);
   const langMap     = { en: 'EN', es: 'ES', pt: 'PT' };
+  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
+    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
+  const detectedCompany = companyMatch?.[1]?.trim() || null;
+  const recordName  = detectedCompany || mem.customerName || cleanPhone;
   const result = await twentyQuery(`
     mutation CreateInquiry($data: InquiryCreateInput!) {
       createInquiry(data: $data) { id referenceNumber }
     }
   `, {
     data: {
+      name:            recordName,
       referenceNumber: mem.refNumber || generateRefNumber(),
       tier:            tierValue,
       status:          'CLOSED_BOT',
@@ -756,6 +761,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.17 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.18 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.17 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.18 running on port ${PORT}`));
