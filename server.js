@@ -1,9 +1,9 @@
-// ATW WhatsApp Bot v10.20
-// Changes from v10.19:
-// - Fixed updateTwentyInquiry: ID! -> UUID! (transcript updates now work)
-// - Capture Twilio ProfileName on every inbound message -> stored as mem.profileName
-// - Inquiry name + Monday item name now use: detectedCompany || customerName || profileName || phone
-// - /flush-redis endpoint kept but moved above app.listen (⚠️ REMOVE BEFORE LAUNCH)
+// ATW WhatsApp Bot v10.21
+// Changes from v10.20:
+// - Added extractFields(): Claude-based structured extraction (replaces all regex)
+// - After every Tier 1/2 message, extracted fields update Twenty + Monday in real time
+// - Record name (Twenty + Monday) updates mid-conversation when company/contact detected
+// - Origin, destination, commodity, weightDims all patch as conversation progresses
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -112,12 +112,50 @@ function generateRefNumber() {
   return `ATW-${yy}${mm}${dd}-${rand}`;
 }
 
-// ─── Helper: best display name ─────────────────────────────────────────────────
-function bestName(mem, cleanPhone) {
-  const fullText     = (mem.messages || []).map(m => m.content).join(' ');
-  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
-    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
-  return companyMatch?.[1]?.trim() || mem.customerName || mem.profileName || cleanPhone;
+// ─── Claude-based structured field extraction ──────────────────────────────────
+async function extractFields(messages) {
+  try {
+    const transcript = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 300,
+        system: `You are a data extraction assistant for a freight forwarder. Extract shipment details from the conversation transcript.
+Return ONLY a valid JSON object with these exact keys:
+{
+  "companyName": string or null,
+  "contactName": string or null,
+  "origin": string or null,
+  "destination": string or null,
+  "commodity": string or null,
+  "weightDims": string or null
+}
+Rules:
+- Use null for any field not clearly mentioned
+- companyName: official company/business name only (e.g. "Advanced Hydraulics Inc")
+- contactName: person's full name if mentioned (e.g. "Miguel Rivera")
+- origin: city, airport, or country of shipment origin
+- destination: city, airport, or country of shipment destination
+- commodity: what is being shipped (e.g. "hydraulic pump", "aircraft engine")
+- weightDims: weight and/or dimensions if mentioned (e.g. "50lb, 8x8x10in")
+Return only the JSON object, no explanation, no markdown.`,
+        messages: [{ role: 'user', content: transcript }]
+      })
+    });
+    const data = await res.json();
+    const text = data?.content?.[0]?.text || '{}';
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch (err) {
+    console.error('[Extract] Field extraction failed:', err.message);
+    return {};
+  }
+}
+
+// ─── Best display name from memory + extracted fields ─────────────────────────
+function bestName(mem, fields, cleanPhone) {
+  return fields?.companyName || fields?.contactName || mem.customerName || mem.profileName || cleanPhone;
 }
 
 function buildSystemPrompt(customerName, inquiryHistory, refNumber) {
@@ -194,9 +232,10 @@ async function findOrCreateContact(phone, name) {
   if (searchResult?.people?.edges?.length > 0) {
     const person   = searchResult.people.edges[0].node;
     const fullName = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
-    const contact  = { id: person.id, name: fullName || null };
+    const isPlaceholder = !fullName || fullName.includes(cleanPhone) || fullName.trim() === 'WhatsApp';
+    const contact  = { id: person.id, name: isPlaceholder ? null : fullName };
     await setTwentyCache(phone, contact);
-    console.log(`[Twenty] Found contact: ${fullName || cleanPhone}`);
+    console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
   }
   const createResult = await twentyQuery(`
@@ -234,18 +273,13 @@ async function getInquiryHistory(contactId) {
   return result?.inquiries?.edges?.map(e => e.node) || [];
 }
 
-async function createTwentyInquiry(contactId, phone, tier, mem) {
+async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
   if (!contactId) return null;
   const cleanPhone = phone.replace('whatsapp:', '');
   const tierValue  = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-  const fullText   = mem.messages.map(m => m.content).join(' ');
-  const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
-  const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
-  const kgMatch     = fullText.match(/(\d+[\d.,]*\s*(?:kg|kgs|kilos|lbs|pounds))/i);
-  const commMatch   = fullText.match(/(?:shipping|sending|cargo|freight|commodity|producto|mercancia|enviar)\s+([a-zA-Z\s]+?)(?:\.|,|\s+from|\s+de|$)/i);
-  const langMap     = { en: 'EN', es: 'ES', pt: 'PT' };
-  const recordName  = bestName(mem, cleanPhone);
+  const langMap    = { en: 'EN', es: 'ES', pt: 'PT' };
+  const recordName = bestName(mem, fields, cleanPhone);
   const result = await twentyQuery(`
     mutation CreateInquiry($data: InquiryCreateInput!) {
       createInquiry(data: $data) { id referenceNumber }
@@ -258,10 +292,10 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
       status:          'CLOSED_BOT',
       language:        langMap[mem.language] || 'EN',
       escalated:       false,
-      origin:          originMatch?.[1]?.trim() || '',
-      destination:     destMatch?.[1]?.trim() || '',
-      commodity:       commMatch?.[1]?.trim() || '',
-      weightDims:      kgMatch?.[1]?.trim() || '',
+      origin:          fields?.origin || '',
+      destination:     fields?.destination || '',
+      commodity:       fields?.commodity || '',
+      weightDims:      fields?.weightDims || '',
       customerPhone:   cleanPhone,
       transcript:      transcript,
       personId:        contactId
@@ -274,7 +308,6 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
   return null;
 }
 
-// ✅ FIXED: ID! -> UUID!
 async function updateTwentyInquiry(inquiryId, updates) {
   if (!inquiryId) return;
   const result = await twentyQuery(`
@@ -283,6 +316,63 @@ async function updateTwentyInquiry(inquiryId, updates) {
     }
   `, { id: inquiryId, data: updates });
   if (result?.updateInquiry) console.log(`[Twenty] Updated inquiry: ${inquiryId}`);
+}
+
+// ─── Mid-conversation record enrichment ───────────────────────────────────────
+async function enrichRecords(mem, phone, fields, isEscalation, mondayItemId) {
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+  const newName    = bestName(mem, fields, cleanPhone);
+
+  // ── Update Twenty inquiry ──
+  if (mem.twentyInquiryId) {
+    const updates = { transcript };
+    if (fields?.origin)      updates.origin      = fields.origin;
+    if (fields?.destination) updates.destination = fields.destination;
+    if (fields?.commodity)   updates.commodity   = fields.commodity;
+    if (fields?.weightDims)  updates.weightDims  = fields.weightDims;
+    if (newName)             updates.name        = newName;
+    if (isEscalation) { updates.tier = 'AOG_EMERGENCY'; updates.escalated = true; updates.status = 'NEW'; }
+    await updateTwentyInquiry(mem.twentyInquiryId, updates);
+  }
+
+  // ── Update Monday item ──
+  if (mondayItemId) {
+    const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const colUpdates = {
+      [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}`
+    };
+    if (isEscalation) {
+      colUpdates[MONDAY_COLS.tier]   = { label: 'AOG Emergency' };
+      colUpdates[MONDAY_COLS.status] = { label: 'Working on it' };
+    }
+    await mondayQuery(
+      `mutation UpdateItem($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
+        change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
+      }`,
+      { boardId: MONDAY_BOARD_ID, itemId: mondayItemId, columnValues: JSON.stringify(colUpdates) }
+    );
+
+    // Update item name if we now have a better one
+    if (newName && mem.refNumber) {
+      const newItemName = `${mem.refNumber} — ${newName}`;
+      await mondayQuery(
+        `mutation RenameItem($itemId: ID!, $newName: String!) {
+          change_item_name(item_id: $itemId, name: $newName) { id }
+        }`,
+        { itemId: mondayItemId, newName: newItemName }
+      );
+      console.log(`[Monday] Updated item name: ${newItemName}`);
+    }
+
+    if (isEscalation) {
+      await mondayQuery(
+        `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
+        { itemId: mondayItemId, body: `ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${transcript}` }
+      );
+      console.log(`[Monday] Escalation update for item ${mondayItemId}`);
+    }
+  }
 }
 
 async function postChatwootProfileNote(chatwootConvId, contact, phone, inquiryHistory) {
@@ -325,16 +415,16 @@ async function mondayQuery(query, variables = {}) {
   } catch (err) { console.error('[Monday] Request failed:', err.message); return null; }
 }
 
-async function createMondayItem(phone, tier, mem) {
+async function createMondayItem(phone, tier, mem, fields) {
   if (!MONDAY_API_KEY || !MONDAY_BOARD_ID) return null;
-  const cleanPhone = phone.replace('whatsapp:', '');
-  const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
-  const langLabel  = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
-  const displayName = bestName(mem, cleanPhone);
-  const itemName   = mem.refNumber ? `${mem.refNumber} — ${displayName}` : displayName;
-  const today      = new Date().toISOString().split('T')[0];
-  const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+  const cleanPhone  = phone.replace('whatsapp:', '');
+  const tierLabel   = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
+  const langLabel   = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
+  const displayName = bestName(mem, fields, cleanPhone);
+  const itemName    = mem.refNumber ? `${mem.refNumber} — ${displayName}` : displayName;
+  const today       = new Date().toISOString().split('T')[0];
+  const now         = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const columnValues = JSON.stringify({
     [MONDAY_COLS.phone]:        cleanPhone,
     [MONDAY_COLS.reference]:    mem.refNumber || '',
@@ -532,7 +622,7 @@ app.post('/webhook', async (req, res) => {
   const {
     From: from, Body: body, MessageSid: sid,
     MediaUrl0: mediaUrl, MediaContentType0: mediaType, NumMedia: numMedia,
-    ProfileName: profileName  // ✅ NEW: Twilio sends the WhatsApp display name
+    ProfileName: profileName
   } = req.body;
 
   if (!from || !sid) return;
@@ -553,10 +643,7 @@ app.post('/webhook', async (req, res) => {
     refNumber: null, refSentToCustomer: false
   };
 
-  // ✅ Always update profileName from Twilio if available
-  if (profileName && profileName.trim()) {
-    mem.profileName = profileName.trim();
-  }
+  if (profileName && profileName.trim()) mem.profileName = profileName.trim();
 
   if (isFirstMessage) {
     mem.mondayItemId      = null;
@@ -568,7 +655,7 @@ app.post('/webhook', async (req, res) => {
     mem.highestTier       = 3;
   }
 
-  let twentyContact = null;
+  let twentyContact  = null;
   let inquiryHistory = [];
   try {
     twentyContact = await findOrCreateContact(from, mem.profileName || null);
@@ -653,8 +740,8 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'assistant', content: reply });
   await setMem(from, mem);
 
-  const tier        = classifyTier(text);
-  const prevHighest = mem.highestTier || 3;
+  const tier         = classifyTier(text);
+  const prevHighest  = mem.highestTier || 3;
   const isEscalation = tier < prevHighest;
   if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
   else { console.log(`[Tier] ${tier} for: "${text}"`); }
@@ -687,48 +774,30 @@ app.post('/webhook', async (req, res) => {
     await setMem(from, mem);
   }
 
-  if ((tier === 1 || tier === 2) && mem.twentyContactId) {
+  // ── Extract fields from full conversation (Claude-based, no regex) ──
+  if (tier === 1 || tier === 2) {
     try {
-      if (!mem.inquiryCreated) {
-        const inquiryId = await createTwentyInquiry(mem.twentyContactId, from, tier, mem);
+      const fields = await extractFields(mem.messages);
+      console.log(`[Extract] Fields: ${JSON.stringify(fields)}`);
+
+      if (!mem.inquiryCreated && mem.twentyContactId) {
+        // First time — create records
+        const inquiryId = await createTwentyInquiry(mem.twentyContactId, from, tier, mem, fields);
         if (inquiryId) {
           mem.twentyInquiryId = inquiryId;
           mem.inquiryCreated  = true;
           await setMem(from, mem);
         }
-      } else if (mem.twentyInquiryId) {
-        const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-        const updates = { transcript };
-        if (isEscalation) { updates.tier = 'AOG_EMERGENCY'; updates.escalated = true; updates.status = 'NEW'; }
-        await updateTwentyInquiry(mem.twentyInquiryId, updates);
+        const itemId = await createMondayItem(from, tier, mem, fields);
+        if (itemId) {
+          mem.mondayItemId = itemId;
+          await setMem(from, mem);
+        }
+      } else {
+        // Subsequent messages — enrich existing records
+        await enrichRecords(mem, from, fields, isEscalation, mem.mondayItemId);
       }
-    } catch (err) { console.error('[Twenty] Inquiry create/update failed:', err.message); }
-  }
-
-  if (tier === 1 || tier === 2) {
-    try {
-      if (!mem.mondayItemId) {
-        const itemId = await createMondayItem(from, tier, mem);
-        if (itemId) { mem.mondayItemId = itemId; await setMem(from, mem); }
-      } else if (isEscalation) {
-        const transcript     = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-        const escalationNote = `ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${transcript}`;
-        await mondayQuery(
-          `mutation UpdateItem($boardId: ID!, $itemId: ID!, $columnValues: JSON!) {
-            change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $columnValues) { id }
-          }`,
-          { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, columnValues: JSON.stringify({
-            [MONDAY_COLS.tier]:   { label: 'AOG Emergency' },
-            [MONDAY_COLS.status]: { label: 'Working on it' }
-          })}
-        );
-        await mondayQuery(
-          `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
-          { itemId: mem.mondayItemId, body: escalationNote }
-        );
-        console.log(`[Monday] Escalation update for item ${mem.mondayItemId}`);
-      }
-    } catch (err) { console.error('[Monday] Failed:', err.message); }
+    } catch (err) { console.error('[Enrich] Failed:', err.message); }
   }
 });
 
@@ -782,6 +851,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.20 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.21 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.20 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.21 running on port ${PORT}`));
