@@ -1,11 +1,9 @@
-// ATW WhatsApp Bot v10.26
-// Changes from v10.25:
-// - effectiveTier: Tier 3 messages never stop enrichment on active Tier 1/2 inquiries
-// - Monday rename: change_simple_column_value with column_id "name"
-// - Attachments: forwarded to Chatwoot BEFORE takeover check — agents always see images
-// - Live agent request: Claude detects in any language, Patty responds naturally,
-//   email alert + Chatwoot private note fired, session flagged for agent pickup
-// - Returning customer greeting: always fires from Twenty history regardless of Redis state
+// ATW WhatsApp Bot v10.27
+// Changes from v10.26:
+// - findOrCreateContact: always queries Twenty first, never relies solely on Redis cache
+//   Prevents duplicate contacts after Redis flush
+// - classifyTier: negation-aware — "not AOG", "no emergency", "not urgent" no longer trigger Tier 1
+// - All v10.26 features included: effectiveTier, live agent, attachments, returning customer
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -70,10 +68,6 @@ async function isBotMessage(sid) {
 }
 async function markBotMessage(sid) {
   await redis.set(`botsent:${sid}`, '1', { EX: DEDUP_TTL });
-}
-async function getTwentyCache(phone) {
-  const raw = await redis.get(`twenty:${phone}`);
-  return raw ? JSON.parse(raw) : null;
 }
 async function setTwentyCache(phone, data) {
   await redis.set(`twenty:${phone}`, JSON.stringify(data), { EX: 24 * 60 * 60 });
@@ -156,7 +150,6 @@ Return only the JSON object, no explanation, no markdown.`,
   }
 }
 
-// ─── Detect live agent request in any language ─────────────────────────────────
 async function detectLiveAgentRequest(text) {
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -176,6 +169,16 @@ async function detectLiveAgentRequest(text) {
 
 function bestName(mem, fields, cleanPhone) {
   return fields?.companyName || fields?.contactName || mem.customerName || mem.profileName || cleanPhone;
+}
+
+// ✅ Negation-aware tier classifier
+function classifyTier(text) {
+  const t = text.toLowerCase();
+  // Strip negated AOG phrases before checking
+  const negatedAOG = /\b(not|no|non|sin|sem)\s+(an?\s+)?(aog|emergency|emergencia|emergencia|urgent|urgente)\b/i.test(t);
+  if (!negatedAOG && /\baog\b|aircraft on ground|grounded|plane down|\bemergency\b|\bemergencia\b/.test(t)) return 1;
+  if (/shipment|cargo|freight|quote|rate|delivery|pickup|package|paquete|enviar|envio|carga|flete|ship|send|dangerous goods|oversized|air freight|ocean freight|kilos|kg|lbs|pounds|dimensions/.test(t)) return 2;
+  return 3;
 }
 
 function buildSystemPrompt(customerName, inquiryHistory, refNumber) {
@@ -238,10 +241,10 @@ async function twentyQuery(query, variables = {}) {
   } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
+// ✅ Always queries Twenty directly — never creates duplicate contacts after Redis flush
 async function findOrCreateContact(phone, name) {
-  const cached = await getTwentyCache(phone);
-  if (cached) return cached;
   const cleanPhone = phone.replace('whatsapp:', '');
+  // Always search Twenty first regardless of cache
   const searchResult = await twentyQuery(`
     query FindPeople($filter: PersonFilterInput) {
       people(filter: $filter) {
@@ -258,6 +261,7 @@ async function findOrCreateContact(phone, name) {
     console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
   }
+  // Not found — create new
   const createResult = await twentyQuery(`
     mutation CreatePeople($data: [PersonCreateInput!]) {
       createPeople(data: $data) { id name { firstName lastName } }
@@ -523,7 +527,7 @@ async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAg
   const badgeText   = isLiveAgentRequest ? 'LIVE AGENT REQUESTED' : isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
   const urgency     = isLiveAgentRequest ? 'LIVE AGENT' : isAOG ? 'AOG / CRITICAL' : 'STANDARD';
   const summaryText = isLiveAgentRequest
-    ? `Customer has requested to speak with a live agent. Conversation transcript is below.`
+    ? 'Customer has requested to speak with a live agent. Conversation transcript is below.'
     : await generateEmailSummary(messages) || messages.find(m => m.role === 'user')?.content || '';
   const origin      = fields?.origin || '---';
   const destination = fields?.destination || '---';
@@ -536,13 +540,6 @@ async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAg
     await resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html });
     console.log(`[Email] ${isLiveAgentRequest ? 'Live agent request' : `Tier ${tier}`} alert sent (${ref})`);
   } catch (err) { console.error('[Email] Failed:', err.message); }
-}
-
-function classifyTier(text) {
-  const t = text.toLowerCase();
-  if (/aog|aircraft on ground|grounded|plane down|emergency|emergencia/.test(t)) return 1;
-  if (/shipment|cargo|freight|quote|rate|delivery|pickup|package|paquete|enviar|envio|carga|flete|ship|send|dangerous goods|oversized|air freight|ocean freight|kilos|kg|lbs|pounds|dimensions/.test(t)) return 2;
-  return 3;
 }
 
 async function callClaude(messages, systemPrompt) {
@@ -610,7 +607,6 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
-// ─── Forward media attachment to Chatwoot ─────────────────────────────────────
 async function forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, caption) {
   try {
     const mediaRes = await fetch(mediaUrl, {
@@ -696,14 +692,14 @@ app.post('/webhook', async (req, res) => {
   mem.lastMessageAt = now;
 
   if (isFirstMessage) {
-    mem.mondayItemId        = null;
-    mem.twentyInquiryId     = null;
-    mem.inquiryCreated      = false;
-    mem.emailSent           = false;
-    mem.refNumber           = null;
-    mem.refSentToCustomer   = false;
-    mem.highestTier         = 3;
-    mem.liveAgentRequested  = false;
+    mem.mondayItemId       = null;
+    mem.twentyInquiryId    = null;
+    mem.inquiryCreated     = false;
+    mem.emailSent          = false;
+    mem.refNumber          = null;
+    mem.refSentToCustomer  = false;
+    mem.highestTier        = 3;
+    mem.liveAgentRequested = false;
   }
 
   // ── Always fetch Twenty contact + history ──
@@ -733,18 +729,16 @@ app.post('/webhook', async (req, res) => {
     );
   }
 
-  // ✅ ATTACHMENTS: forward to Chatwoot BEFORE takeover check so agents always see images
+  // ✅ Attachments: forward BEFORE takeover check
   const hasMedia = parseInt(numMedia || '0') > 0;
   if (hasMedia && chatwootConvId) {
     await forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, text);
-    // If in takeover, agent sees image — nothing more to do
     const takeoverCheck = await getTakeover(chatwootConvId);
     if (takeoverCheck?.active) {
       if (now - takeoverCheck.lastAgentMessage <= TAKEOVER_RESUME) return;
       await delTakeover(chatwootConvId);
       console.log(`[Takeover] Auto-resumed for conv ${chatwootConvId}`);
     }
-    // Not in takeover — send ack to customer
     const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
     const lang = await detectLanguage(recentText);
     mem.language = lang;
@@ -753,7 +747,7 @@ app.post('/webhook', async (req, res) => {
     return;
   }
 
-  // ── Takeover check (non-media messages) ──
+  // ── Takeover check (text messages) ──
   if (chatwootConvId) {
     const takeoverState = await getTakeover(chatwootConvId);
     if (takeoverState?.active) {
@@ -775,7 +769,7 @@ app.post('/webhook', async (req, res) => {
 
   try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
 
-  // ✅ Live agent request detection
+  // ── Live agent detection ──
   let isLiveAgentRequest = false;
   if (!mem.liveAgentRequested) {
     try { isLiveAgentRequest = await detectLiveAgentRequest(text); } catch { /* skip */ }
@@ -784,8 +778,6 @@ app.post('/webhook', async (req, res) => {
   if (isLiveAgentRequest) {
     mem.liveAgentRequested = true;
     console.log(`[LiveAgent] Request detected from ${from}`);
-
-    // Patty's natural response
     const liveAgentReplies = {
       es: 'Claro, con gusto te conecto con uno de nuestros especialistas. Un miembro del equipo estara contigo en breve.',
       pt: 'Claro, vou conecta-lo com um de nossos especialistas. Um membro da equipe estara com voce em breve.',
@@ -795,13 +787,13 @@ app.post('/webhook', async (req, res) => {
     await sendWhatsApp(from, liveReply);
     if (chatwootConvId) {
       await sendChatwootMessage(chatwootConvId, liveReply, 'outgoing');
-      await sendChatwootMessage(chatwootConvId, `⚠️ LIVE AGENT REQUESTED\nPhone: ${from.replace('whatsapp:', '')}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`, 'outgoing', true);
+      await sendChatwootMessage(chatwootConvId,
+        `⚠️ LIVE AGENT REQUESTED\nPhone: ${from.replace('whatsapp:', '')}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`,
+        'outgoing', true
+      );
     }
-
-    // Fire alert email immediately
     const fields = await extractFields(mem.messages).catch(() => ({}));
     await sendEmailAlert(mem.highestTier || 3, from, mem.messages, mem.refNumber, fields, true);
-
     mem.messages.push({ role: 'assistant', content: liveReply });
     await setMem(from, mem);
     return;
@@ -827,7 +819,6 @@ app.post('/webhook', async (req, res) => {
   if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
   else { console.log(`[Tier] ${tier} for: "${text}"`); }
 
-  // ✅ effectiveTier: never downgrade mid-conversation
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
 
   if (effectiveTier <= 2 && !mem.refNumber) {
@@ -852,7 +843,6 @@ app.post('/webhook', async (req, res) => {
 
   await setMem(from, mem);
 
-  // ── Extract fields → create or enrich records ──
   if (effectiveTier <= 2) {
     let fields = {};
     try {
@@ -939,6 +929,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.26 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.27 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.26 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.27 running on port ${PORT}`));
