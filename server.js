@@ -1,9 +1,11 @@
-// ATW WhatsApp Bot v10.24
-// Changes from v10.23:
-// - Email now fires 5 minutes after last message (inactivity detection via setInterval)
-// - Removed all mid-conversation email triggers
-// - Added mem.lastMessageAt timestamp on every inbound message
-// - Background interval scans all active sessions every 60s for idle conversations
+// ATW WhatsApp Bot v10.26
+// Changes from v10.25:
+// - effectiveTier: Tier 3 messages never stop enrichment on active Tier 1/2 inquiries
+// - Monday rename: change_simple_column_value with column_id "name"
+// - Attachments: forwarded to Chatwoot BEFORE takeover check — agents always see images
+// - Live agent request: Claude detects in any language, Patty responds naturally,
+//   email alert + Chatwoot private note fired, session flagged for agent pickup
+// - Returning customer greeting: always fires from Twenty history regardless of Redis state
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -24,15 +26,15 @@ redis.on('error', err => console.error('[Redis] Error:', err));
 redis.on('connect', () => console.log('[Redis] Connected'));
 await redis.connect();
 
-const MEMORY_TTL        = 24 * 60 * 60;
-const TAKEOVER_TTL      = 3 * 60 * 60;
-const DEDUP_TTL         = 24 * 60 * 60;
-const RATE_TTL          = 10 * 60;
-const RATE_MAX          = 15;
-const MEMORY_LIMIT      = 10;
-const TAKEOVER_RESUME   = 2 * 60 * 60 * 1000;
-const INACTIVITY_MS     = 5 * 60 * 1000; // 5 minutes
-const SCAN_INTERVAL_MS  = 60 * 1000;     // check every 60 seconds
+const MEMORY_TTL       = 24 * 60 * 60;
+const TAKEOVER_TTL     = 3 * 60 * 60;
+const DEDUP_TTL        = 24 * 60 * 60;
+const RATE_TTL         = 10 * 60;
+const RATE_MAX         = 15;
+const MEMORY_LIMIT     = 10;
+const TAKEOVER_RESUME  = 2 * 60 * 60 * 1000;
+const INACTIVITY_MS    = 5 * 60 * 1000;
+const SCAN_INTERVAL_MS = 60 * 1000;
 
 async function getMem(phone) {
   const raw = await redis.get(`mem:${phone}`);
@@ -152,6 +154,24 @@ Return only the JSON object, no explanation, no markdown.`,
     console.error('[Extract] Field extraction failed:', err.message);
     return {};
   }
+}
+
+// ─── Detect live agent request in any language ─────────────────────────────────
+async function detectLiveAgentRequest(text) {
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.CLAUDE_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 5,
+        system: 'Detect if the message is a request to speak with a human agent, live person, or real representative. Reply only with "yes" or "no".',
+        messages: [{ role: 'user', content: text }]
+      })
+    });
+    const data = await res.json();
+    return data?.content?.[0]?.text?.trim().toLowerCase() === 'yes';
+  } catch { return false; }
 }
 
 function bestName(mem, fields, cleanPhone) {
@@ -488,19 +508,23 @@ async function generateEmailSummary(messages) {
   } catch (err) { console.error('[Email] Summary generation failed:', err.message); return null; }
 }
 
-async function sendEmailAlert(tier, phone, messages, refNumber, fields) {
-  if (tier === 3) return;
+async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAgentRequest = false) {
+  if (tier === 3 && !isLiveAgentRequest) return;
   const cleanPhone  = phone.replace('whatsapp:', '');
   const isAOG       = tier === 1;
   const ref         = refNumber || '---';
-  const subject     = isAOG
-    ? `AOG EMERGENCY [${ref}] — WhatsApp Inquiry from ${cleanPhone}`
-    : `New Shipment Inquiry [${ref}] — WhatsApp from ${cleanPhone}`;
-  const accentColor = isAOG ? '#CC0000' : '#003366';
-  const badgeColor  = isAOG ? '#CC0000' : '#0055A4';
-  const badgeText   = isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
-  const urgency     = isAOG ? 'AOG / CRITICAL' : 'STANDARD';
-  const summaryText = await generateEmailSummary(messages) || messages.find(m => m.role === 'user')?.content || '';
+  const subject     = isLiveAgentRequest
+    ? `LIVE AGENT REQUESTED [${ref}] — WhatsApp from ${cleanPhone}`
+    : isAOG
+      ? `AOG EMERGENCY [${ref}] — WhatsApp Inquiry from ${cleanPhone}`
+      : `New Shipment Inquiry [${ref}] — WhatsApp from ${cleanPhone}`;
+  const accentColor = isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#003366';
+  const badgeColor  = isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#0055A4';
+  const badgeText   = isLiveAgentRequest ? 'LIVE AGENT REQUESTED' : isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
+  const urgency     = isLiveAgentRequest ? 'LIVE AGENT' : isAOG ? 'AOG / CRITICAL' : 'STANDARD';
+  const summaryText = isLiveAgentRequest
+    ? `Customer has requested to speak with a live agent. Conversation transcript is below.`
+    : await generateEmailSummary(messages) || messages.find(m => m.role === 'user')?.content || '';
   const origin      = fields?.origin || '---';
   const destination = fields?.destination || '---';
   const convRows    = messages.map(m => {
@@ -510,7 +534,7 @@ async function sendEmailAlert(tier, phone, messages, refNumber, fields) {
   const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;"><table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f4;padding:30px 0;"><tr><td align="center"><table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fff;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.08);"><tr><td style="background:${accentColor};padding:20px 30px;"><span style="font-size:22px;font-weight:700;color:#fff;letter-spacing:1px;">ATW CARGO</span><span style="font-size:13px;color:rgba(255,255,255,0.8);margin-left:12px;">WhatsApp Bot Alert</span></td></tr><tr><td style="background:${badgeColor};padding:10px 30px;"><span style="font-size:13px;font-weight:700;color:#fff;letter-spacing:1px;">${badgeText}</span></td></tr><tr><td style="padding:24px 30px 8px;"><p style="margin:0 0 20px;font-size:15px;color:#333;line-height:1.6;">${summaryText}</p><table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;"><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:130px;border-bottom:1px solid #e0e0e0;">Reference</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${ref}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Client</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Origin</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${origin.toUpperCase()}</td></tr><tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr><tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgency}</td></tr></table></td></tr><tr><td style="padding:20px 30px 8px;"><p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#333;">Full Conversation</p><table width="100%" cellpadding="0" cellspacing="0">${convRows}</table></td></tr><tr><td style="background:#f4f4f4;padding:16px 30px;border-top:1px solid #e0e0e0;"><span style="font-size:12px;color:#999;">ATW WhatsApp Bot · ${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET</span></td></tr></table></td></tr></table></body></html>`;
   try {
     await resend.emails.send({ from: 'ATW Bot <onboarding@resend.dev>', to: ['digital@atwcargo.com'], subject, html });
-    console.log(`[Email] Tier ${tier} alert sent (${ref})`);
+    console.log(`[Email] ${isLiveAgentRequest ? 'Live agent request' : `Tier ${tier}`} alert sent (${ref})`);
   } catch (err) { console.error('[Email] Failed:', err.message); }
 }
 
@@ -586,9 +610,29 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
+// ─── Forward media attachment to Chatwoot ─────────────────────────────────────
+async function forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, caption) {
+  try {
+    const mediaRes = await fetch(mediaUrl, {
+      headers: { Authorization: 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64') }
+    });
+    if (!mediaRes.ok) { console.error('[Attachment] Twilio media fetch failed:', mediaRes.status); return; }
+    const buffer = Buffer.from(await mediaRes.arrayBuffer());
+    const ext    = (mediaType || 'application/octet-stream').split('/')[1] || 'bin';
+    const fd     = new FormData();
+    fd.append('content', caption || 'Customer sent an attachment.');
+    fd.append('message_type', 'incoming');
+    fd.append('attachments[]', buffer, { filename: `attachment.${ext}`, contentType: mediaType });
+    const res = await fetch(
+      `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT}/conversations/${chatwootConvId}/messages`,
+      { method: 'POST', headers: { 'api_access_token': CHATWOOT_TOKEN, ...fd.getHeaders() }, body: fd }
+    );
+    if (res.ok) console.log('[Attachment] Forwarded to Chatwoot');
+    else console.error('[Attachment] Chatwoot upload failed:', res.status);
+  } catch (err) { console.error('[Attachment] Failed:', err.message); }
+}
+
 // ─── Background inactivity scanner ────────────────────────────────────────────
-// Scans all active mem: keys every 60s
-// If last message > 5 min ago, tier 1/2, email not sent → extract fields → send email
 setInterval(async () => {
   try {
     const keys = await redis.keys('mem:whatsapp:*');
@@ -602,13 +646,10 @@ setInterval(async () => {
         if (!mem.lastMessageAt) continue;
         if (Date.now() - mem.lastMessageAt < INACTIVITY_MS) continue;
         if (!mem.messages?.length) continue;
-
         const phone = key.replace('mem:', '');
         console.log(`[Idle] Conversation idle for ${phone} — sending email`);
-
         const fields = await extractFields(mem.messages);
         await sendEmailAlert(mem.highestTier, phone, mem.messages, mem.refNumber, fields);
-
         mem.emailSent = true;
         await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
       } catch (err) { console.error('[Idle] Error processing key:', err.message); }
@@ -648,24 +689,24 @@ app.post('/webhook', async (req, res) => {
     emailSent: false, mondayItemId: null,
     language: 'en', highestTier: 3,
     refNumber: null, refSentToCustomer: false,
-    lastMessageAt: null
+    lastMessageAt: null, liveAgentRequested: false
   };
 
   if (profileName && profileName.trim()) mem.profileName = profileName.trim();
-
-  // ✅ Always update lastMessageAt
   mem.lastMessageAt = now;
 
   if (isFirstMessage) {
-    mem.mondayItemId      = null;
-    mem.twentyInquiryId   = null;
-    mem.inquiryCreated    = false;
-    mem.emailSent         = false;
-    mem.refNumber         = null;
-    mem.refSentToCustomer = false;
-    mem.highestTier       = 3;
+    mem.mondayItemId        = null;
+    mem.twentyInquiryId     = null;
+    mem.inquiryCreated      = false;
+    mem.emailSent           = false;
+    mem.refNumber           = null;
+    mem.refSentToCustomer   = false;
+    mem.highestTier         = 3;
+    mem.liveAgentRequested  = false;
   }
 
+  // ── Always fetch Twenty contact + history ──
   let twentyContact  = null;
   let inquiryHistory = [];
   try {
@@ -692,6 +733,27 @@ app.post('/webhook', async (req, res) => {
     );
   }
 
+  // ✅ ATTACHMENTS: forward to Chatwoot BEFORE takeover check so agents always see images
+  const hasMedia = parseInt(numMedia || '0') > 0;
+  if (hasMedia && chatwootConvId) {
+    await forwardAttachmentToChatwoot(chatwootConvId, mediaUrl, mediaType, text);
+    // If in takeover, agent sees image — nothing more to do
+    const takeoverCheck = await getTakeover(chatwootConvId);
+    if (takeoverCheck?.active) {
+      if (now - takeoverCheck.lastAgentMessage <= TAKEOVER_RESUME) return;
+      await delTakeover(chatwootConvId);
+      console.log(`[Takeover] Auto-resumed for conv ${chatwootConvId}`);
+    }
+    // Not in takeover — send ack to customer
+    const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
+    const lang = await detectLanguage(recentText);
+    mem.language = lang;
+    await setMem(from, mem);
+    await sendWhatsApp(from, getAttachmentAck(lang));
+    return;
+  }
+
+  // ── Takeover check (non-media messages) ──
   if (chatwootConvId) {
     const takeoverState = await getTakeover(chatwootConvId);
     if (takeoverState?.active) {
@@ -705,31 +767,6 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  const hasMedia = parseInt(numMedia || '0') > 0;
-  if (hasMedia && chatwootConvId) {
-    try {
-      const mediaRes = await fetch(mediaUrl, {
-        headers: { Authorization: 'Basic ' + Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64') }
-      });
-      const buffer = Buffer.from(await mediaRes.arrayBuffer());
-      const ext    = (mediaType || 'application/octet-stream').split('/')[1] || 'bin';
-      const fd     = new FormData();
-      fd.append('content', text || 'Customer sent an attachment.');
-      fd.append('message_type', 'incoming');
-      fd.append('attachments[]', buffer, { filename: `attachment.${ext}`, contentType: mediaType });
-      await fetch(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT}/conversations/${chatwootConvId}/messages`, {
-        method: 'POST', headers: { 'api_access_token': CHATWOOT_TOKEN, ...fd.getHeaders() }, body: fd
-      });
-    } catch (err) { console.error('[Attachment] Failed:', err.message); }
-    const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
-    const lang = await detectLanguage(recentText);
-    mem.language = lang;
-    await setMem(from, mem);
-    await sendWhatsApp(from, getAttachmentAck(lang));
-    await sendChatwootMessage(chatwootConvId, getAttachmentAck(lang));
-    return;
-  }
-
   if (!text) return;
   if (chatwootConvId) await sendChatwootMessage(chatwootConvId, text, 'incoming');
 
@@ -738,8 +775,40 @@ app.post('/webhook', async (req, res) => {
 
   try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
 
-  const systemPrompt = buildSystemPrompt(mem.customerName, inquiryHistory, mem.refNumber);
+  // ✅ Live agent request detection
+  let isLiveAgentRequest = false;
+  if (!mem.liveAgentRequested) {
+    try { isLiveAgentRequest = await detectLiveAgentRequest(text); } catch { /* skip */ }
+  }
 
+  if (isLiveAgentRequest) {
+    mem.liveAgentRequested = true;
+    console.log(`[LiveAgent] Request detected from ${from}`);
+
+    // Patty's natural response
+    const liveAgentReplies = {
+      es: 'Claro, con gusto te conecto con uno de nuestros especialistas. Un miembro del equipo estara contigo en breve.',
+      pt: 'Claro, vou conecta-lo com um de nossos especialistas. Um membro da equipe estara com voce em breve.',
+      en: 'Of course, let me connect you with one of our team members. A specialist will be with you shortly.'
+    };
+    const liveReply = liveAgentReplies[mem.language] || liveAgentReplies['en'];
+    await sendWhatsApp(from, liveReply);
+    if (chatwootConvId) {
+      await sendChatwootMessage(chatwootConvId, liveReply, 'outgoing');
+      await sendChatwootMessage(chatwootConvId, `⚠️ LIVE AGENT REQUESTED\nPhone: ${from.replace('whatsapp:', '')}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`, 'outgoing', true);
+    }
+
+    // Fire alert email immediately
+    const fields = await extractFields(mem.messages).catch(() => ({}));
+    await sendEmailAlert(mem.highestTier || 3, from, mem.messages, mem.refNumber, fields, true);
+
+    mem.messages.push({ role: 'assistant', content: liveReply });
+    await setMem(from, mem);
+    return;
+  }
+
+  // ── Normal Claude response ──
+  const systemPrompt = buildSystemPrompt(mem.customerName, inquiryHistory, mem.refNumber);
   let reply;
   try {
     reply = await callClaude(mem.messages, systemPrompt);
@@ -758,7 +827,10 @@ app.post('/webhook', async (req, res) => {
   if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
   else { console.log(`[Tier] ${tier} for: "${text}"`); }
 
-  if ((tier === 1 || tier === 2) && !mem.refNumber) {
+  // ✅ effectiveTier: never downgrade mid-conversation
+  const effectiveTier = Math.min(tier, mem.highestTier || 3);
+
+  if (effectiveTier <= 2 && !mem.refNumber) {
     mem.refNumber = generateRefNumber();
     console.log(`[Ref] Generated ${mem.refNumber}`);
   }
@@ -781,7 +853,7 @@ app.post('/webhook', async (req, res) => {
   await setMem(from, mem);
 
   // ── Extract fields → create or enrich records ──
-  if (tier === 1 || tier === 2) {
+  if (effectiveTier <= 2) {
     let fields = {};
     try {
       fields = await extractFields(mem.messages);
@@ -790,7 +862,7 @@ app.post('/webhook', async (req, res) => {
 
     try {
       if (!mem.inquiryCreated && mem.twentyContactId) {
-        const inquiryId = await createTwentyInquiry(mem.twentyContactId, from, tier, mem, fields);
+        const inquiryId = await createTwentyInquiry(mem.twentyContactId, from, effectiveTier, mem, fields);
         if (inquiryId) {
           mem.twentyInquiryId = inquiryId;
           mem.inquiryCreated  = true;
@@ -798,7 +870,7 @@ app.post('/webhook', async (req, res) => {
         }
       }
       if (!mem.mondayItemId) {
-        const itemId = await createMondayItem(from, tier, mem, fields);
+        const itemId = await createMondayItem(from, effectiveTier, mem, fields);
         if (itemId) {
           mem.mondayItemId = itemId;
           await setMem(from, mem);
@@ -837,7 +909,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
       const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
       if (mem.mondayItemId) updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err => console.error('[Monday] Final update failed:', err.message));
       if (mem.twentyInquiryId) updateTwentyInquiry(mem.twentyInquiryId, { status: 'CLOSED_AGENT', transcript }).catch(err => console.error('[Twenty] #done update failed:', err.message));
-      // ── Fire email immediately on #done if not already sent ──
       if (!mem.emailSent && mem.highestTier && mem.highestTier < 3) {
         extractFields(mem.messages).then(fields => {
           sendEmailAlert(mem.highestTier, to, mem.messages, mem.refNumber, fields);
@@ -868,6 +939,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.24 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.26 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.24 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.26 running on port ${PORT}`));
