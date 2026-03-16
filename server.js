@@ -1,9 +1,9 @@
-// ATW WhatsApp Bot v10.22
-// Changes from v10.21:
-// - extractFields() always runs BEFORE create or enrich — correct name from the start
-// - Email origin/destination pulled from extractFields, not regex
-// - Monday item rename uses change_multiple_column_values on the name column (correct API)
-// - Monday creation and Twenty creation unified under single fields extraction call
+// ATW WhatsApp Bot v10.24
+// Changes from v10.23:
+// - Email now fires 5 minutes after last message (inactivity detection via setInterval)
+// - Removed all mid-conversation email triggers
+// - Added mem.lastMessageAt timestamp on every inbound message
+// - Background interval scans all active sessions every 60s for idle conversations
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -24,13 +24,15 @@ redis.on('error', err => console.error('[Redis] Error:', err));
 redis.on('connect', () => console.log('[Redis] Connected'));
 await redis.connect();
 
-const MEMORY_TTL      = 24 * 60 * 60;
-const TAKEOVER_TTL    = 3 * 60 * 60;
-const DEDUP_TTL       = 24 * 60 * 60;
-const RATE_TTL        = 10 * 60;
-const RATE_MAX        = 15;
-const MEMORY_LIMIT    = 10;
-const TAKEOVER_RESUME = 2 * 60 * 60 * 1000;
+const MEMORY_TTL        = 24 * 60 * 60;
+const TAKEOVER_TTL      = 3 * 60 * 60;
+const DEDUP_TTL         = 24 * 60 * 60;
+const RATE_TTL          = 10 * 60;
+const RATE_MAX          = 15;
+const MEMORY_LIMIT      = 10;
+const TAKEOVER_RESUME   = 2 * 60 * 60 * 1000;
+const INACTIVITY_MS     = 5 * 60 * 1000; // 5 minutes
+const SCAN_INTERVAL_MS  = 60 * 1000;     // check every 60 seconds
 
 async function getMem(phone) {
   const raw = await redis.get(`mem:${phone}`);
@@ -112,7 +114,6 @@ function generateRefNumber() {
   return `ATW-${yy}${mm}${dd}-${rand}`;
 }
 
-// ─── Claude-based structured field extraction ──────────────────────────────────
 async function extractFields(messages) {
   try {
     const transcript = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -153,7 +154,6 @@ Return only the JSON object, no explanation, no markdown.`,
   }
 }
 
-// ─── Best display name ─────────────────────────────────────────────────────────
 function bestName(mem, fields, cleanPhone) {
   return fields?.companyName || fields?.contactName || mem.customerName || mem.profileName || cleanPhone;
 }
@@ -230,10 +230,10 @@ async function findOrCreateContact(phone, name) {
     }
   `, { filter: { phones: { primaryPhoneNumber: { like: `%${cleanPhone}%` } } } });
   if (searchResult?.people?.edges?.length > 0) {
-    const person      = searchResult.people.edges[0].node;
-    const fullName    = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
+    const person        = searchResult.people.edges[0].node;
+    const fullName      = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
     const isPlaceholder = !fullName || fullName.includes(cleanPhone) || fullName.trim() === 'WhatsApp';
-    const contact     = { id: person.id, name: isPlaceholder ? null : fullName };
+    const contact       = { id: person.id, name: isPlaceholder ? null : fullName };
     await setTwentyCache(phone, contact);
     console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
@@ -323,7 +323,6 @@ async function enrichRecords(mem, phone, fields, isEscalation) {
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const newName    = bestName(mem, fields, cleanPhone);
 
-  // ── Update Twenty ──
   if (mem.twentyInquiryId) {
     const updates = { transcript };
     if (fields?.origin)      updates.origin      = fields.origin;
@@ -335,12 +334,9 @@ async function enrichRecords(mem, phone, fields, isEscalation) {
     await updateTwentyInquiry(mem.twentyInquiryId, updates);
   }
 
-  // ── Update Monday ──
   if (mem.mondayItemId) {
     const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-    const colUpdates = {
-      [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}`
-    };
+    const colUpdates = { [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}` };
     if (isEscalation) {
       colUpdates[MONDAY_COLS.tier]   = { label: 'AOG Emergency' };
       colUpdates[MONDAY_COLS.status] = { label: 'Working on it' };
@@ -351,19 +347,16 @@ async function enrichRecords(mem, phone, fields, isEscalation) {
       }`,
       { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, columnValues: JSON.stringify(colUpdates) }
     );
-
-    // ── Rename Monday item if we have a better name ──
     if (newName && mem.refNumber) {
       const newItemName = `${mem.refNumber} — ${newName}`;
       await mondayQuery(
-        `mutation RenameItem($boardId: ID!, $itemId: ID!, $newName: String!) {
-          change_item_name(item_id: $itemId, board_id: $boardId, value: $newName) { id }
+        `mutation RenameItem($boardId: ID!, $itemId: ID!, $value: String!) {
+          change_simple_column_value(board_id: $boardId, item_id: $itemId, column_id: "name", value: $value) { id }
         }`,
-        { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, newName: newItemName }
+        { boardId: MONDAY_BOARD_ID, itemId: mem.mondayItemId, value: newItemName }
       );
       console.log(`[Monday] Renamed item: ${newItemName}`);
     }
-
     if (isEscalation) {
       await mondayQuery(
         `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
@@ -482,18 +475,6 @@ function getAttachmentAck(lang) {
   return acks[lang] || acks['en'];
 }
 
-function isEmailReady(messages) {
-  const customerMessages = messages.filter(m => m.role === 'user');
-  if (customerMessages.length < 3) return false;
-  const fullText = customerMessages.map(m => m.content).join(' ').toLowerCase();
-  let fieldsFound = 0;
-  if (/from\s+[a-zA-Z]/.test(fullText) || /\b(mia|miami|jfk|lax|ord|lhr|cdg|ams|dxb|nbo|bog|gru|mex)\b/.test(fullText)) fieldsFound++;
-  if (/\b(london|heathrow|lhr|paris|dubai|tokyo|bogota|nairobi)\b/.test(fullText) || /(?:to|hacia|para)\s+[a-zA-Z]/.test(fullText)) fieldsFound++;
-  if (/\d+\s*(kg|kgs|kilos|lbs|pounds)|part\s*(number|#|no)?[\s:]*[a-zA-Z0-9-]{5,}|hydraulic|pump|engine|avionics|gear|actuator|sensor/.test(fullText)) fieldsFound++;
-  if (/\d+\s*x\s*\d+|\bdimensions?\b|\bweight\b|\bkg\b|\blbs\b/.test(fullText)) fieldsFound++;
-  return fieldsFound >= 2;
-}
-
 async function generateEmailSummary(messages) {
   try {
     const transcript = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -520,7 +501,6 @@ async function sendEmailAlert(tier, phone, messages, refNumber, fields) {
   const badgeText   = isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
   const urgency     = isAOG ? 'AOG / CRITICAL' : 'STANDARD';
   const summaryText = await generateEmailSummary(messages) || messages.find(m => m.role === 'user')?.content || '';
-  // ✅ Use extracted fields for origin/destination — no more regex
   const origin      = fields?.origin || '---';
   const destination = fields?.destination || '---';
   const convRows    = messages.map(m => {
@@ -606,6 +586,36 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
+// ─── Background inactivity scanner ────────────────────────────────────────────
+// Scans all active mem: keys every 60s
+// If last message > 5 min ago, tier 1/2, email not sent → extract fields → send email
+setInterval(async () => {
+  try {
+    const keys = await redis.keys('mem:whatsapp:*');
+    for (const key of keys) {
+      try {
+        const raw = await redis.get(key);
+        if (!raw) continue;
+        const mem = JSON.parse(raw);
+        if (mem.emailSent) continue;
+        if (!mem.highestTier || mem.highestTier === 3) continue;
+        if (!mem.lastMessageAt) continue;
+        if (Date.now() - mem.lastMessageAt < INACTIVITY_MS) continue;
+        if (!mem.messages?.length) continue;
+
+        const phone = key.replace('mem:', '');
+        console.log(`[Idle] Conversation idle for ${phone} — sending email`);
+
+        const fields = await extractFields(mem.messages);
+        await sendEmailAlert(mem.highestTier, phone, mem.messages, mem.refNumber, fields);
+
+        mem.emailSent = true;
+        await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
+      } catch (err) { console.error('[Idle] Error processing key:', err.message); }
+    }
+  } catch (err) { console.error('[Idle] Scanner error:', err.message); }
+}, SCAN_INTERVAL_MS);
+
 // ⚠️ REMOVE BEFORE LAUNCH
 app.get('/flush-redis', async (req, res) => {
   await redis.flushAll();
@@ -637,10 +647,14 @@ app.post('/webhook', async (req, res) => {
     twentyContactId: null, twentyInquiryId: null, inquiryCreated: false,
     emailSent: false, mondayItemId: null,
     language: 'en', highestTier: 3,
-    refNumber: null, refSentToCustomer: false
+    refNumber: null, refSentToCustomer: false,
+    lastMessageAt: null
   };
 
   if (profileName && profileName.trim()) mem.profileName = profileName.trim();
+
+  // ✅ Always update lastMessageAt
+  mem.lastMessageAt = now;
 
   if (isFirstMessage) {
     mem.mondayItemId      = null;
@@ -663,7 +677,7 @@ app.post('/webhook', async (req, res) => {
       if (inquiryHistory.length > 0) {
         const langMap = { EN: 'en', ES: 'es', PT: 'pt' };
         if (!mem.language || mem.language === 'en') mem.language = langMap[inquiryHistory[0].language] || 'en';
-        console.log(`[Twenty] Returning customer with ${inquiryHistory.length} past inquiries`);
+        if (isFirstMessage) console.log(`[Twenty] Returning customer with ${inquiryHistory.length} past inquiries`);
       }
     }
   } catch (err) { console.error('[Twenty] Contact lookup failed:', err.message); }
@@ -724,7 +738,8 @@ app.post('/webhook', async (req, res) => {
 
   try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
 
-  const systemPrompt = buildSystemPrompt(mem.customerName, isFirstMessage ? inquiryHistory : [], mem.refNumber);
+  const systemPrompt = buildSystemPrompt(mem.customerName, inquiryHistory, mem.refNumber);
+
   let reply;
   try {
     reply = await callClaude(mem.messages, systemPrompt);
@@ -751,7 +766,7 @@ app.post('/webhook', async (req, res) => {
   if (mem.refNumber && !mem.refSentToCustomer) {
     const langAck = {
       es: `Tu numero de referencia es ${mem.refNumber}. Guardalo para cualquier seguimiento.`,
-      pt: `Seu numero de referencia e ${mem.refNumber}. Guarde-o para qualquer acompanhamento.`,
+      pt: `Seu numero de referencia e ${mem.refNumber}. Guarde-o para qualquier acompanhamento.`,
       en: `I've logged your inquiry under reference number ${mem.refNumber}. Please keep this handy for any follow-up.`
     };
     const refReply = `${reply}\n\n${langAck[mem.language] || langAck['en']}`;
@@ -765,7 +780,7 @@ app.post('/webhook', async (req, res) => {
 
   await setMem(from, mem);
 
-  // ── Extract fields first on every Tier 1/2 message ──
+  // ── Extract fields → create or enrich records ──
   if (tier === 1 || tier === 2) {
     let fields = {};
     try {
@@ -773,14 +788,6 @@ app.post('/webhook', async (req, res) => {
       console.log(`[Extract] Fields: ${JSON.stringify(fields)}`);
     } catch (err) { console.error('[Extract] Failed:', err.message); }
 
-    // ── Email alert (now receives fields for accurate origin/destination) ──
-    if ((!mem.emailSent || isEscalation) && isEmailReady(mem.messages)) {
-      await sendEmailAlert(tier, from, mem.messages, mem.refNumber, fields);
-      mem.emailSent = true;
-      await setMem(from, mem);
-    }
-
-    // ── Create or enrich records ──
     try {
       if (!mem.inquiryCreated && mem.twentyContactId) {
         const inquiryId = await createTwentyInquiry(mem.twentyContactId, from, tier, mem, fields);
@@ -830,6 +837,14 @@ app.post('/chatwoot-webhook', async (req, res) => {
       const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
       if (mem.mondayItemId) updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err => console.error('[Monday] Final update failed:', err.message));
       if (mem.twentyInquiryId) updateTwentyInquiry(mem.twentyInquiryId, { status: 'CLOSED_AGENT', transcript }).catch(err => console.error('[Twenty] #done update failed:', err.message));
+      // ── Fire email immediately on #done if not already sent ──
+      if (!mem.emailSent && mem.highestTier && mem.highestTier < 3) {
+        extractFields(mem.messages).then(fields => {
+          sendEmailAlert(mem.highestTier, to, mem.messages, mem.refNumber, fields);
+          mem.emailSent = true;
+          setMem(to, mem);
+        }).catch(err => console.error('[Email] #done email failed:', err.message));
+      }
     }
     await delTakeover(convId);
     await sendChatwootMessage(convId, 'Bot has resumed.', 'outgoing', true);
@@ -853,6 +868,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.22 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.24 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.22 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.24 running on port ${PORT}`));
