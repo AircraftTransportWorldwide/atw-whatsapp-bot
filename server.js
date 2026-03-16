@@ -992,3 +992,10 @@ app.post('/chatwoot-webhook', async (req, res) => {
 app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.29 — online'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.29 running on port ${PORT}`));
+
+
+
+app.get('/flush-redis', async (req, res) => {
+  await redis.flushAll();
+  res.send('Redis flushed OK');
+});
