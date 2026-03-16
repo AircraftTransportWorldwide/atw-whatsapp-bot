@@ -1,7 +1,9 @@
-// ATW WhatsApp Bot v10.19
-// Twenty: fixed getInquiryHistory filter to use personId
-// Twenty: fixed createTwentyInquiry connect syntax
-// Monday: added raw response logging for debug
+// ATW WhatsApp Bot v10.20
+// Changes from v10.19:
+// - Fixed updateTwentyInquiry: ID! -> UUID! (transcript updates now work)
+// - Capture Twilio ProfileName on every inbound message -> stored as mem.profileName
+// - Inquiry name + Monday item name now use: detectedCompany || customerName || profileName || phone
+// - /flush-redis endpoint kept but moved above app.listen (⚠️ REMOVE BEFORE LAUNCH)
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -22,12 +24,12 @@ redis.on('error', err => console.error('[Redis] Error:', err));
 redis.on('connect', () => console.log('[Redis] Connected'));
 await redis.connect();
 
-const MEMORY_TTL   = 24 * 60 * 60;
-const TAKEOVER_TTL = 3 * 60 * 60;
-const DEDUP_TTL    = 24 * 60 * 60;
-const RATE_TTL     = 10 * 60;
-const RATE_MAX     = 15;
-const MEMORY_LIMIT = 10;
+const MEMORY_TTL      = 24 * 60 * 60;
+const TAKEOVER_TTL    = 3 * 60 * 60;
+const DEDUP_TTL       = 24 * 60 * 60;
+const RATE_TTL        = 10 * 60;
+const RATE_MAX        = 15;
+const MEMORY_LIMIT    = 10;
 const TAKEOVER_RESUME = 2 * 60 * 60 * 1000;
 
 async function getMem(phone) {
@@ -108,6 +110,14 @@ function generateRefNumber() {
   const dd   = String(now.getDate()).padStart(2, '0');
   const rand = String(Math.floor(1000 + Math.random() * 9000));
   return `ATW-${yy}${mm}${dd}-${rand}`;
+}
+
+// ─── Helper: best display name ─────────────────────────────────────────────────
+function bestName(mem, cleanPhone) {
+  const fullText     = (mem.messages || []).map(m => m.content).join(' ');
+  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
+    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
+  return companyMatch?.[1]?.trim() || mem.customerName || mem.profileName || cleanPhone;
 }
 
 function buildSystemPrompt(customerName, inquiryHistory, refNumber) {
@@ -226,19 +236,16 @@ async function getInquiryHistory(contactId) {
 
 async function createTwentyInquiry(contactId, phone, tier, mem) {
   if (!contactId) return null;
-  const cleanPhone  = phone.replace('whatsapp:', '');
-  const tierValue   = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
-  const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-  const fullText    = mem.messages.map(m => m.content).join(' ');
+  const cleanPhone = phone.replace('whatsapp:', '');
+  const tierValue  = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
+  const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+  const fullText   = mem.messages.map(m => m.content).join(' ');
   const originMatch = fullText.match(/from\s+([a-zA-Z\s]+?)(?:\s+to|\s+a\s)/i);
   const destMatch   = fullText.match(/(?:\bto\b|\ba\b|\bhacia\b|\bpara\b)\s+([a-zA-Z\s,]+?)(?:\.|,|\s+I|\s+we|\s+the|$)/i);
   const kgMatch     = fullText.match(/(\d+[\d.,]*\s*(?:kg|kgs|kilos|lbs|pounds))/i);
   const commMatch   = fullText.match(/(?:shipping|sending|cargo|freight|commodity|producto|mercancia|enviar)\s+([a-zA-Z\s]+?)(?:\.|,|\s+from|\s+de|$)/i);
   const langMap     = { en: 'EN', es: 'ES', pt: 'PT' };
-  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
-    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
-  const detectedCompany = companyMatch?.[1]?.trim() || null;
-  const recordName  = detectedCompany || mem.customerName || cleanPhone;
+  const recordName  = bestName(mem, cleanPhone);
   const result = await twentyQuery(`
     mutation CreateInquiry($data: InquiryCreateInput!) {
       createInquiry(data: $data) { id referenceNumber }
@@ -267,10 +274,11 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
   return null;
 }
 
+// ✅ FIXED: ID! -> UUID!
 async function updateTwentyInquiry(inquiryId, updates) {
   if (!inquiryId) return;
   const result = await twentyQuery(`
-    mutation UpdateInquiry($id: ID!, $data: InquiryUpdateInput!) {
+    mutation UpdateInquiry($id: UUID!, $data: InquiryUpdateInput!) {
       updateInquiry(id: $id, data: $data) { id }
     }
   `, { id: inquiryId, data: updates });
@@ -322,14 +330,8 @@ async function createMondayItem(phone, tier, mem) {
   const cleanPhone = phone.replace('whatsapp:', '');
   const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
   const langLabel  = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
-  const fullText   = mem.messages.map(m => m.content).join(' ');
-  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
-    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
-  const detectedCompany = companyMatch?.[1]?.trim() || null;
-  const displayName = detectedCompany || mem.customerName || cleanPhone;
-  const itemName   = mem.refNumber
-    ? `${mem.refNumber} — ${displayName}`
-    : displayName;
+  const displayName = bestName(mem, cleanPhone);
+  const itemName   = mem.refNumber ? `${mem.refNumber} — ${displayName}` : displayName;
   const today      = new Date().toISOString().split('T')[0];
   const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -517,11 +519,22 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
+// ⚠️ REMOVE BEFORE LAUNCH
+app.get('/flush-redis', async (req, res) => {
+  await redis.flushAll();
+  res.send('Redis flushed OK');
+});
+
 app.post('/webhook', async (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send('<Response></Response>');
 
-  const { From: from, Body: body, MessageSid: sid, MediaUrl0: mediaUrl, MediaContentType0: mediaType, NumMedia: numMedia } = req.body;
+  const {
+    From: from, Body: body, MessageSid: sid,
+    MediaUrl0: mediaUrl, MediaContentType0: mediaType, NumMedia: numMedia,
+    ProfileName: profileName  // ✅ NEW: Twilio sends the WhatsApp display name
+  } = req.body;
+
   if (!from || !sid) return;
   if (await isDuplicate(sid)) { console.log(`[Dedup] Skipped ${sid}`); return; }
 
@@ -533,12 +546,18 @@ app.post('/webhook', async (req, res) => {
   let mem = await getMem(from);
   const isFirstMessage = !mem || mem.messages.length === 0;
   if (!mem) mem = {
-    messages: [], customerName: null, twentyContactId: null,
-    twentyInquiryId: null, inquiryCreated: false,
+    messages: [], customerName: null, profileName: null,
+    twentyContactId: null, twentyInquiryId: null, inquiryCreated: false,
     emailSent: false, mondayItemId: null,
     language: 'en', highestTier: 3,
     refNumber: null, refSentToCustomer: false
   };
+
+  // ✅ Always update profileName from Twilio if available
+  if (profileName && profileName.trim()) {
+    mem.profileName = profileName.trim();
+  }
+
   if (isFirstMessage) {
     mem.mondayItemId      = null;
     mem.twentyInquiryId   = null;
@@ -552,7 +571,7 @@ app.post('/webhook', async (req, res) => {
   let twentyContact = null;
   let inquiryHistory = [];
   try {
-    twentyContact = await findOrCreateContact(from, null);
+    twentyContact = await findOrCreateContact(from, mem.profileName || null);
     if (twentyContact) {
       mem.twentyContactId = twentyContact.id;
       if (twentyContact.name && !mem.customerName) mem.customerName = twentyContact.name;
@@ -565,7 +584,7 @@ app.post('/webhook', async (req, res) => {
     }
   } catch (err) { console.error('[Twenty] Contact lookup failed:', err.message); }
 
-  const chatwootContactId = await findOrCreateChatwootContact(from, mem.customerName || from.replace('whatsapp:', ''));
+  const chatwootContactId = await findOrCreateChatwootContact(from, mem.customerName || mem.profileName || from.replace('whatsapp:', ''));
   let chatwootConvId = null;
   if (chatwootContactId) chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId);
 
@@ -634,8 +653,8 @@ app.post('/webhook', async (req, res) => {
   mem.messages.push({ role: 'assistant', content: reply });
   await setMem(from, mem);
 
-  const tier         = classifyTier(text);
-  const prevHighest  = mem.highestTier || 3;
+  const tier        = classifyTier(text);
+  const prevHighest = mem.highestTier || 3;
   const isEscalation = tier < prevHighest;
   if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
   else { console.log(`[Tier] ${tier} for: "${text}"`); }
@@ -763,11 +782,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.19 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.20 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.19 running on port ${PORT}`));
-
-app.get('/flush-redis', async (req, res) => {
-  await redis.flushAll();
-  res.send('Redis flushed OK');
-});
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.20 running on port ${PORT}`));
