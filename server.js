@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.16
+// ATW WhatsApp Bot v10.17
 // Twenty: fixed getInquiryHistory filter to use personId
 // Twenty: fixed createTwentyInquiry connect syntax
 // Monday: added raw response logging for debug
@@ -317,9 +317,14 @@ async function createMondayItem(phone, tier, mem) {
   const cleanPhone = phone.replace('whatsapp:', '');
   const tierLabel  = tier === 1 ? 'AOG Emergency' : 'Freight Inquiry';
   const langLabel  = mem.language === 'es' ? 'Spanish' : mem.language === 'pt' ? 'Portuguese' : 'English';
+  const fullText   = mem.messages.map(m => m.content).join(' ');
+  const companyMatch = fullText.match(/company\s+(?:name\s+)?(?:is\s+)?([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)?\.?)/i)
+    || fullText.match(/(?:from|with|at)\s+([A-Z][A-Za-z0-9\s,\.&]+(?:Inc|LLC|Ltd|Corp|Co|S\.A|SAS|GmbH)\.?)/i);
+  const detectedCompany = companyMatch?.[1]?.trim() || null;
+  const displayName = detectedCompany || mem.customerName || cleanPhone;
   const itemName   = mem.refNumber
-    ? `${mem.refNumber} — ${mem.customerName || cleanPhone}`
-    : (mem.customerName || cleanPhone);
+    ? `${mem.refNumber} — ${displayName}`
+    : displayName;
   const today      = new Date().toISOString().split('T')[0];
   const now        = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
@@ -751,6 +756,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.16 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.17 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.16 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.17 running on port ${PORT}`));
