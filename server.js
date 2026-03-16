@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.18
+// ATW WhatsApp Bot v10.19
 // Twenty: fixed getInquiryHistory filter to use personId
 // Twenty: fixed createTwentyInquiry connect syntax
 // Monday: added raw response logging for debug
@@ -270,10 +270,10 @@ async function createTwentyInquiry(contactId, phone, tier, mem) {
 async function updateTwentyInquiry(inquiryId, updates) {
   if (!inquiryId) return;
   const result = await twentyQuery(`
-    mutation UpdateInquiry($id: ID!, $input: UpdateInquiryInput!) {
-      updateInquiry(id: $id, input: $input) { id }
+    mutation UpdateInquiry($id: ID!, $data: InquiryUpdateInput!) {
+      updateInquiry(id: $id, data: $data) { id }
     }
-  `, { id: inquiryId, input: updates });
+  `, { id: inquiryId, data: updates });
   if (result?.updateInquiry) console.log(`[Twenty] Updated inquiry: ${inquiryId}`);
 }
 
@@ -677,9 +677,11 @@ app.post('/webhook', async (req, res) => {
           mem.inquiryCreated  = true;
           await setMem(from, mem);
         }
-      } else if (isEscalation && mem.twentyInquiryId) {
+      } else if (mem.twentyInquiryId) {
         const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-        await updateTwentyInquiry(mem.twentyInquiryId, { tier: 'AOG_EMERGENCY', escalated: true, status: 'NEW', transcript });
+        const updates = { transcript };
+        if (isEscalation) { updates.tier = 'AOG_EMERGENCY'; updates.escalated = true; updates.status = 'NEW'; }
+        await updateTwentyInquiry(mem.twentyInquiryId, updates);
       }
     } catch (err) { console.error('[Twenty] Inquiry create/update failed:', err.message); }
   }
@@ -761,6 +763,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.18 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.19 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.18 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.19 running on port ${PORT}`));
