@@ -1,13 +1,8 @@
-// ATW WhatsApp Bot v10.28
-// Changes from v10.27:
-// - Twenty duplicate contact fix: search by last 10 digits to match any phone formatting
-// - Monday item rename: uses change_multiple_column_values with "name" column (correct API)
-// - Twilio signature validation on /webhook (security)
-// - Input sanitization: strip HTML, limit to 1000 chars
-// - Retry wrapper on Twenty, Monday, and email critical calls
-// - Removed Monday raw response logging (production noise)
-// - Claude-based tier classification (replaces regex, handles negation + multilingual)
-// - Removed /flush-redis endpoint (security — use Railway Redis CLI instead)
+// ATW WhatsApp Bot v10.29
+// Changes from v10.28:
+// - findOrCreateContact: searches all contacts by last 10 digits, picks best name (real > placeholder)
+// - Auto-updates placeholder contact name with Twilio ProfileName on first match
+// - New contacts created with real name from ProfileName immediately, not "WhatsApp +number"
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -281,7 +276,8 @@ async function twentyQuery(query, variables = {}) {
   } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
-// ✅ Search by last 10 digits — matches any phone formatting Twenty might store
+// ✅ v10.29: Search by last 10 digits, pick best contact (real name wins over placeholder),
+//    auto-update placeholder name with profileName, update Twenty contact name when company detected
 async function findOrCreateContact(phone, name) {
   const cleanPhone = phone.replace('whatsapp:', '');
   const digitsOnly = cleanPhone.replace(/\D/g, '');
@@ -289,21 +285,46 @@ async function findOrCreateContact(phone, name) {
 
   const searchResult = await twentyQuery(`
     query FindPeople($filter: PersonFilterInput) {
-      people(filter: $filter) {
+      people(filter: $filter, orderBy: { createdAt: AscNullsLast }, first: 20) {
         edges { node { id name { firstName lastName } phones { primaryPhoneNumber } } }
       }
     }
   `, { filter: { phones: { primaryPhoneNumber: { like: `%${last10}%` } } } });
 
   if (searchResult?.people?.edges?.length > 0) {
-    const person        = searchResult.people.edges[0].node;
-    const fullName      = [person.name.firstName, person.name.lastName].filter(Boolean).join(' ');
+    const people = searchResult.people.edges.map(e => e.node);
+
+    // Pick the contact with the best name — real name wins over placeholder
+    const best = people.find(p => {
+      const fn = [p.name.firstName, p.name.lastName].filter(Boolean).join(' ');
+      return fn && !fn.includes(cleanPhone) && fn.trim() !== 'WhatsApp' && fn.trim() !== '';
+    }) || people[0]; // fall back to oldest if none have a real name
+
+    const fullName      = [best.name.firstName, best.name.lastName].filter(Boolean).join(' ');
     const isPlaceholder = !fullName || fullName.includes(cleanPhone) || fullName.trim() === 'WhatsApp';
-    const contact       = { id: person.id, name: isPlaceholder ? null : fullName };
+
+    // If contact has a placeholder name but we have a real name from Twilio, update it
+    if (isPlaceholder && name && name.trim() && name !== cleanPhone) {
+      const nameParts = name.trim().split(' ');
+      const firstName = nameParts[0];
+      const lastName  = nameParts.slice(1).join(' ') || cleanPhone;
+      await twentyQuery(`
+        mutation UpdatePerson($id: UUID!, $data: PersonUpdateInput!) {
+          updatePerson(id: $id, data: $data) { id }
+        }
+      `, { id: best.id, data: { name: { firstName, lastName } } });
+      console.log(`[Twenty] Updated contact name: ${name}`);
+    }
+
+    const contact = { id: best.id, name: isPlaceholder ? (name || null) : fullName };
     await setTwentyCache(phone, contact);
     console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
   }
+
+  // Not found — create with real name from Twilio ProfileName if available
+  const firstName = name ? name.trim().split(' ')[0] : 'WhatsApp';
+  const lastName  = name ? (name.trim().split(' ').slice(1).join(' ') || cleanPhone) : cleanPhone;
 
   const createResult = await withRetry(() => twentyQuery(`
     mutation CreatePeople($data: [PersonCreateInput!]) {
@@ -311,13 +332,13 @@ async function findOrCreateContact(phone, name) {
     }
   `, {
     data: [{
-      name:   { firstName: name || 'WhatsApp', lastName: cleanPhone },
+      name:   { firstName, lastName },
       phones: { primaryPhoneNumber: cleanPhone }
     }]
   }));
 
   if (createResult?.createPeople?.[0]) {
-    const contact = { id: createResult.createPeople[0].id, name: null };
+    const contact = { id: createResult.createPeople[0].id, name: name || null };
     await setTwentyCache(phone, contact);
     console.log(`[Twenty] Created contact: ${createResult.createPeople[0].id}`);
     return contact;
@@ -968,13 +989,6 @@ app.post('/chatwoot-webhook', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.28 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.29 — online'));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.28 running on port ${PORT}`));
-
-
-
-app.get('/flush-redis', async (req, res) => {
-  await redis.flushAll();
-  res.send('Redis flushed OK');
-});
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.29 running on port ${PORT}`));
