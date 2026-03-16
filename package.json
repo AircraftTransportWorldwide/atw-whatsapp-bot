@@ -1,6 +1,6 @@
 {
   "name": "atw-whatsapp-bot",
-  "version": "10.29.0",
+  "version": "10.30.0",
   "description": "ATW WhatsApp Bot — Patty",
   "type": "module",
   "main": "server.js",
