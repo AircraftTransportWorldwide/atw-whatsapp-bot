@@ -4,13 +4,49 @@ const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
 const CLAUDE_URL   = 'https://api.anthropic.com/v1/messages';
 const ATW_PHONE    = '+1 (305) 456-8400';
 
-const COMPLIANCE_DISCLAIMER = {
-  en: `ATW is a licensed freight forwarder. By engaging with us, you consent to cargo screening in compliance with TSA and Department of Homeland Security regulations. ATW reserves the right to modify routing or upgrade booking class to meet your ETA if original arrangements are cancelled or modified, without penalties. For urgent assistance call ${ATW_PHONE}. Replies may be monitored for quality and compliance.`,
-  es: `ATW es un agente de carga autorizado. Al comunicarse con nosotros, usted acepta que su carga sea inspeccionada de acuerdo con las regulaciones de la TSA y el Departamento de Seguridad Nacional. ATW se reserva el derecho de modificar la ruta o mejorar la clase de reserva para cumplir con su ETA si los arreglos originales son cancelados o modificados, sin penalidades. Para asistencia urgente llame al ${ATW_PHONE}. Las respuestas pueden ser monitoreadas por control de calidad y cumplimiento.`,
-  pt: `ATW é um despachante aduaneiro licenciado. Ao nos contatar, você consente com a triagem de carga em conformidade com os regulamentos da TSA e do Departamento de Segurança Interna. ATW reserva-se o direito de modificar o roteiro ou atualizar a classe de reserva para cumprir seu ETA se os arranjos originais forem cancelados ou modificados, sem penalidades. Para assistência urgente ligue para ${ATW_PHONE}. As respostas podem ser monitoradas para fins de qualidade e conformidade.`
+// ── Language name map for system messages ──
+const LANG_NAMES = {
+  en: 'English', es: 'Spanish', pt: 'Portuguese', fr: 'French',
+  de: 'German',  it: 'Italian', nl: 'Dutch',      ar: 'Arabic',
+  zh: 'Chinese', ja: 'Japanese', ko: 'Korean',    ru: 'Russian',
+  pl: 'Polish',  tr: 'Turkish', vi: 'Vietnamese', hi: 'Hindi',
+  he: 'Hebrew',  sv: 'Swedish', da: 'Danish',     no: 'Norwegian'
 };
 
-export { COMPLIANCE_DISCLAIMER };
+// ── Translation cache — avoids re-translating identical strings ──
+const translationCache = new Map();
+
+// Translate any system message to the detected language.
+// Falls back to English if translation fails.
+export async function translateSystemMessage(textInEnglish, lang) {
+  if (!lang || lang === 'en') return textInEnglish;
+  const cacheKey = `${lang}::${textInEnglish.slice(0, 60)}`;
+  if (translationCache.has(cacheKey)) return translationCache.get(cacheKey);
+
+  try {
+    const langName = LANG_NAMES[lang] || lang;
+    const res = await fetch(CLAUDE_URL, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 300,
+        system: `You are a professional translator. Translate the following text to ${langName}. 
+Return ONLY the translated text — no explanations, no quotes, no preamble. 
+Preserve any phone numbers, reference numbers (ATW-XXXXXX), or proper nouns exactly as they are.`,
+        messages: [{ role: 'user', content: textInEnglish }]
+      })
+    });
+    const data = await res.json();
+    const translated = data?.content?.[0]?.text?.trim() || textInEnglish;
+    translationCache.set(cacheKey, translated);
+    return translated;
+  } catch {
+    return textInEnglish; // safe fallback
+  }
+}
+
+export { ATW_PHONE };
 
 function headers() {
   return {
@@ -42,7 +78,7 @@ export async function detectLanguage(text) {
       headers: headers(),
       body: JSON.stringify({
         model: CLAUDE_MODEL, max_tokens: 5,
-        system: 'Detect the language of the text. Reply with only the 2-letter ISO code: en, es, pt, de, fr, or other.',
+        system: 'Detect the language of the text. Reply with only the 2-letter ISO 639-1 code (e.g. en, es, pt, de, fr, it, nl, ar, zh, ja, ko, ru, pl, tr, vi, hi, he, sv, da, no). If unsure, reply with "en".',
         messages: [{ role: 'user', content: text }]
       })
     });
@@ -170,6 +206,8 @@ ${contextBlock}
 GREETING (use only for new customers with no history):
 "Hi, I'm Patty from ATW. We handle everything from AOG emergencies to complex international freight — always with the urgency and care your shipment deserves. What can I do for you today?"
 
+LANGUAGE: Detect the customer's language from their first message and respond in that same language throughout the entire conversation. You support all languages fluently.
+
 YOUR JOB:
 Gather the following information naturally through conversation:
 - Commodity or cargo description
@@ -184,7 +222,6 @@ STRICT FORMATTING RULES — THIS IS THE MOST IMPORTANT INSTRUCTION:
 - You MUST NOT use bold, italics, headers, or any markdown formatting.
 - You MUST NOT use emojis.
 - If you need to mention multiple things, write them as a natural sentence: "I'll need the weight, dimensions, and destination" — never as a list.
-- Read the customer's language and reply in the same language. Support English, Spanish, and Portuguese.
 
 GUARDRAILS:
 - Never provide internal pricing, rate quotes, or binding commitments.
