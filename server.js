@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.31 — server.js
+// ATW WhatsApp Bot v10.32 — server.js
 // Clean entry point — routes and orchestration only
 // All logic lives in /services and /utils
 
@@ -22,6 +22,7 @@ import { findOrCreateContact, getInquiryHistory, createTwentyInquiry, updateTwen
 import { createMondayItem, updateMondayItem, enrichRecords } from './services/monday.js';
 import { sendChatwootMessage, findOrCreateChatwootContact, findOrCreateChatwootConversation, postChatwootProfileNote, forwardAttachmentToChatwoot } from './services/chatwoot.js';
 import { sendEmailAlert } from './services/email.js';
+import { sendMorningBriefing } from './services/morning.js';
 
 const app          = express();
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -35,13 +36,12 @@ const MEMORY_LIMIT    = 10;
 const TAKEOVER_RESUME = 2 * 60 * 60 * 1000;
 const INACTIVITY_MS   = 5 * 60 * 1000;
 const ATW_PHONE       = '+1 (305) 456-8400';
+const SLA_AOG_MS      = 15 * 60 * 1000; // 15 minutes
 
 // ── Test/novelty message detection ──
 const TEST_PATTERNS = /^\s*(test|testing|prueba|probando|teste|testando|hola|hello|hi|hey|oi|ola|ping|check|checking)\s*[!?.]*\s*$/i;
 
 // ── Qualified inquiry check ──
-// Fires Monday + email only when conversation shows real freight intent.
-// Requires tier 1 or 2 AND at least 2 of: origin, destination, commodity, weightDims, 3+ messages.
 function isQualifiedInquiry(effectiveTier, fields, messageCount) {
   if (effectiveTier > 2) return false;
   let signals = 0;
@@ -51,6 +51,25 @@ function isQualifiedInquiry(effectiveTier, fields, messageCount) {
   if (fields?.weightDims)  signals++;
   if (messageCount >= 3)   signals++;
   return signals >= 2;
+}
+
+// ── Confirmation summary — all fields collected? ──
+function hasAllFields(fields) {
+  return !!(fields?.origin && fields?.destination && fields?.commodity && fields?.weightDims);
+}
+
+function buildConfirmationMessage(fields, refNumber, lang) {
+  const origin      = fields.origin.toUpperCase();
+  const destination = fields.destination.toUpperCase();
+  const commodity   = fields.commodity;
+  const weight      = fields.weightDims;
+  const ref         = refNumber || '---';
+  const msgs = {
+    en: `Just to confirm your inquiry (${ref}): ${commodity} from ${origin} to ${destination}, ${weight}. Is that correct? Our team will be in touch shortly.`,
+    es: `Solo para confirmar su consulta (${ref}): ${commodity} de ${origin} a ${destination}, ${weight}. ¿Es correcto? Nuestro equipo estará en contacto en breve.`,
+    pt: `Só para confirmar sua consulta (${ref}): ${commodity} de ${origin} para ${destination}, ${weight}. Está correto? Nossa equipe entrará em contato em breve.`
+  };
+  return msgs[lang] || msgs.en;
 }
 
 async function sendWhatsApp(to, body) {
@@ -68,31 +87,99 @@ function getAttachmentAck(lang) {
   }[lang] || 'Got your file. Let me pass that along to our team.';
 }
 
-// ─── Background inactivity scanner ────────────────────────────────────────────
+// ── Time-ago helper ──
+function timeAgo(ms) {
+  const diff = Date.now() - ms;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
+// ── Is it 8am Miami time? ──
+function isMorningBriefingTime() {
+  const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
+  return now.startsWith('08:0'); // fires between 08:00 and 08:09
+}
+
+// ─── Background scanners ───────────────────────────────────────────────────────
+let morningBriefingSentToday = null;
+
 setInterval(async () => {
   try {
     const keys = await redis.keys('mem:whatsapp:*');
+    const allInquiries = [];
+
     for (const key of keys) {
       try {
         const raw = await redis.get(key);
         if (!raw) continue;
         const mem = JSON.parse(raw);
-        if (mem.emailSent) continue;
-        if (!mem.highestTier || mem.highestTier === 3) continue;
-        if (!mem.lastMessageAt) continue;
-        if (Date.now() - mem.lastMessageAt < INACTIVITY_MS) continue;
-        if (!mem.messages?.length) continue;
-        // Only send idle email if inquiry was qualified
-        if (!mem.inquiryQualified) continue;
         const phone = key.replace('mem:', '');
-        console.log(`[Idle] Conversation idle for ${phone} — sending email`);
-        const fields = await extractFields(mem.messages);
-        await sendEmailAlert(mem.highestTier, phone, mem.messages, mem.refNumber, fields);
-        mem.emailSent = true;
-        await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
-      } catch (err) { console.error('[Idle] Error processing key:', err.message); }
+
+        // ── Idle email scanner ──
+        if (!mem.emailSent && mem.highestTier && mem.highestTier < 3 &&
+            mem.lastMessageAt && Date.now() - mem.lastMessageAt >= INACTIVITY_MS &&
+            mem.messages?.length && mem.inquiryQualified) {
+          console.log(`[Idle] Conversation idle for ${phone} — sending email`);
+          const fields = await extractFields(mem.messages);
+          await sendEmailAlert(mem.highestTier, phone, mem.messages, mem.refNumber, fields);
+          mem.emailSent = true;
+          await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
+        }
+
+        // ── SLA breach scanner — AOG only ──
+        if (mem.highestTier === 1 && mem.inquiryQualified && !mem.slaAlertSent) {
+          const aogAge = Date.now() - (mem.aogCreatedAt || mem.lastMessageAt);
+          if (aogAge >= SLA_AOG_MS) {
+            // Check if an agent has taken over
+            const chatwootConvId = mem.chatwootConvId;
+            const takeover = chatwootConvId ? await getTakeover(chatwootConvId) : null;
+            if (!takeover?.active) {
+              console.log(`[SLA] AOG breach — no agent response in 15min for ${phone}`);
+              // Send urgent SLA breach email
+              await sendEmailAlert(1, phone, mem.messages, mem.refNumber, {
+                origin: mem.lastFields?.origin,
+                destination: mem.lastFields?.destination,
+                commodity: mem.lastFields?.commodity,
+                weightDims: mem.lastFields?.weightDims
+              }, false, true); // true = sla breach
+              mem.slaAlertSent = true;
+              await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
+            }
+          }
+        }
+
+        // ── Collect for morning briefing ──
+        if (mem.inquiryQualified && mem.highestTier < 3 && mem.lastMessageAt &&
+            Date.now() - mem.lastMessageAt < 24 * 60 * 60 * 1000) {
+          allInquiries.push({
+            phone: phone.replace('whatsapp:', ''),
+            tier: mem.highestTier,
+            refNumber: mem.refNumber,
+            language: mem.language,
+            company: mem.lastFields?.companyName,
+            contactName: mem.customerName || mem.profileName,
+            origin: mem.lastFields?.origin,
+            destination: mem.lastFields?.destination,
+            commodity: mem.lastFields?.commodity,
+            timeAgo: timeAgo(mem.lastMessageAt)
+          });
+        }
+
+      } catch (err) { console.error('[Scanner] Error processing key:', err.message); }
     }
-  } catch (err) { console.error('[Idle] Scanner error:', err.message); }
+
+    // ── Morning briefing — fires once at 8am Miami ──
+    const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+    if (isMorningBriefingTime() && morningBriefingSentToday !== today && allInquiries.length > 0) {
+      morningBriefingSentToday = today;
+      console.log(`[Morning] Sending briefing with ${allInquiries.length} inquiries`);
+      await sendMorningBriefing(allInquiries);
+    }
+
+  } catch (err) { console.error('[Scanner] Error:', err.message); }
 }, 60 * 1000);
 
 // ─── Inbound WhatsApp webhook ──────────────────────────────────────────────────
@@ -124,7 +211,9 @@ app.post('/webhook', async (req, res) => {
     language: 'en', highestTier: 3,
     refNumber: null, refSentToCustomer: false,
     lastMessageAt: null, liveAgentRequested: false, disclaimerSent: false,
-    inquiryQualified: false, isTestConversation: false
+    inquiryQualified: false, isTestConversation: false,
+    confirmationSent: false, aogCreatedAt: null, slaAlertSent: false,
+    chatwootConvId: null, lastFields: {}
   };
 
   if (profileName?.trim()) mem.profileName = profileName.trim();
@@ -135,9 +224,9 @@ app.post('/webhook', async (req, res) => {
     mem.emailSent = false; mem.refNumber = null; mem.refSentToCustomer = false;
     mem.highestTier = 3; mem.liveAgentRequested = false; mem.disclaimerSent = false;
     mem.inquiryQualified = false; mem.isTestConversation = false;
+    mem.confirmationSent = false; mem.aogCreatedAt = null; mem.slaAlertSent = false;
+    mem.lastFields = {};
 
-    // Flag test/novelty openers — they still get a response but won't trigger CRM/email
-    // until the conversation proves real intent
     if (text && TEST_PATTERNS.test(text)) {
       mem.isTestConversation = true;
       console.log(`[Test] Novelty/test opener detected from ${from} — CRM/email deferred`);
@@ -164,6 +253,7 @@ app.post('/webhook', async (req, res) => {
   const chatwootContactId = await findOrCreateChatwootContact(from, mem.customerName || mem.profileName || from.replace('whatsapp:', ''));
   let chatwootConvId = null;
   if (chatwootContactId) chatwootConvId = await findOrCreateChatwootConversation(chatwootContactId);
+  if (chatwootConvId) mem.chatwootConvId = chatwootConvId;
   if (isFirstMessage && twentyContact && chatwootConvId) {
     postChatwootProfileNote(chatwootConvId, twentyContact, from, inquiryHistory).catch(err => console.error('[Twenty] Profile note failed:', err.message));
   }
@@ -247,8 +337,11 @@ app.post('/webhook', async (req, res) => {
   const tier         = await classifyTier(text);
   const prevHighest  = mem.highestTier || 3;
   const isEscalation = tier < prevHighest;
-  if (isEscalation) { mem.highestTier = tier; console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`); }
-  else { console.log(`[Tier] ${tier} for: "${text.slice(0, 60)}"`); }
+  if (isEscalation) {
+    mem.highestTier = tier;
+    if (tier === 1 && !mem.aogCreatedAt) mem.aogCreatedAt = now; // start SLA clock
+    console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`);
+  } else { console.log(`[Tier] ${tier} for: "${text.slice(0, 60)}"`); }
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
 
   if (effectiveTier <= 2 && !mem.refNumber) {
@@ -276,10 +369,12 @@ app.post('/webhook', async (req, res) => {
     try { fields = await extractFields(mem.messages); console.log(`[Extract] Fields: ${JSON.stringify(fields)}`); }
     catch (err) { console.error('[Extract] Failed:', err.message); }
 
+    // Store latest fields for morning briefing + SLA scanner
+    if (Object.keys(fields).length) mem.lastFields = fields;
+
     const messageCount = mem.messages.filter(m => m.role === 'user').length;
     const qualified    = isQualifiedInquiry(effectiveTier, fields, messageCount);
 
-    // Clear test flag if conversation has evolved into a real inquiry
     if (qualified && mem.isTestConversation) {
       mem.isTestConversation = false;
       console.log(`[Test] Conversation from ${from} graduated to real inquiry`);
@@ -303,6 +398,16 @@ app.post('/webhook', async (req, res) => {
           await enrichRecords(mem, from, fields, isEscalation);
         }
       } catch (err) { console.error('[Enrich] Failed:', err.message); }
+
+      // ── Confirmation summary — send once all fields are collected ──
+      if (!mem.confirmationSent && hasAllFields(fields)) {
+        const confirmation = buildConfirmationMessage(fields, mem.refNumber, mem.language);
+        await sendWhatsApp(from, confirmation);
+        if (chatwootConvId) await sendChatwootMessage(chatwootConvId, confirmation, 'outgoing');
+        mem.confirmationSent = true;
+        console.log(`[Confirm] Summary sent to ${from}`);
+      }
+
     } else {
       console.log(`[Qualify] Not yet qualified (tier:${effectiveTier}, signals: origin:${!!fields?.origin} dest:${!!fields?.destination} commodity:${!!fields?.commodity} msgs:${messageCount}) — CRM/Monday deferred`);
     }
@@ -364,9 +469,9 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.31 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.32 — online'));
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 await redis.connect();
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.31 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.32 running on port ${PORT}`));
