@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.32 — server.js
+// ATW WhatsApp Bot v10.33 — server.js
 // Clean entry point — routes and orchestration only
 // All logic lives in /services and /utils
 
@@ -17,7 +17,11 @@ import {
 import { sanitizeInput, generateRefNumber, bestName } from './utils/helpers.js';
 
 // ── Services ──
-import { callClaude, detectLanguage, extractFields, detectLiveAgentRequest, classifyTier, buildSystemPrompt } from './services/claude.js';
+import {
+  callClaude, detectLanguage, extractFields,
+  detectLiveAgentRequest, classifyTier,
+  buildSystemPrompt, translateSystemMessage, ATW_PHONE
+} from './services/claude.js';
 import { findOrCreateContact, getInquiryHistory, createTwentyInquiry, updateTwentyInquiry } from './services/twenty.js';
 import { createMondayItem, updateMondayItem, enrichRecords } from './services/monday.js';
 import { sendChatwootMessage, findOrCreateChatwootContact, findOrCreateChatwootConversation, postChatwootProfileNote, forwardAttachmentToChatwoot } from './services/chatwoot.js';
@@ -35,8 +39,17 @@ app.use(express.json());
 const MEMORY_LIMIT    = 10;
 const TAKEOVER_RESUME = 2 * 60 * 60 * 1000;
 const INACTIVITY_MS   = 5 * 60 * 1000;
-const ATW_PHONE       = '+1 (305) 456-8400';
-const SLA_AOG_MS      = 15 * 60 * 1000; // 15 minutes
+const SLA_AOG_MS      = 15 * 60 * 1000;
+
+// ── Static English templates — translated dynamically per language ──
+const T = {
+  attachmentAck:    `Got your file. Let me pass that along to our team.`,
+  liveAgentReply:   `Of course, let me connect you with one of our team members. A specialist will be with you shortly.`,
+  refAck:           (ref) => `I've logged your inquiry under reference number ${ref}. Please keep this handy for any follow-up.`,
+  confirmSummary:   (fields, ref) => `Just to confirm your inquiry (${ref}): ${fields.commodity} from ${fields.origin?.toUpperCase()} to ${fields.destination?.toUpperCase()}, ${fields.weightDims}. Is that correct? Our team will be in touch shortly.`,
+  disclaimer:       `ATW is a licensed freight forwarder. By engaging with us, you consent to cargo screening in compliance with TSA and Department of Homeland Security regulations. ATW reserves the right to modify routing or upgrade booking class to meet your ETA if original arrangements are cancelled or modified, without penalties. For urgent assistance call ${ATW_PHONE}. Replies may be monitored for quality and compliance.`,
+  technicalError:   `I'm having a technical issue. Please call us at ${ATW_PHONE} for immediate assistance.`,
+};
 
 // ── Test/novelty message detection ──
 const TEST_PATTERNS = /^\s*(test|testing|prueba|probando|teste|testando|hola|hello|hi|hey|oi|ola|ping|check|checking)\s*[!?.]*\s*$/i;
@@ -53,23 +66,8 @@ function isQualifiedInquiry(effectiveTier, fields, messageCount) {
   return signals >= 2;
 }
 
-// ── Confirmation summary — all fields collected? ──
 function hasAllFields(fields) {
   return !!(fields?.origin && fields?.destination && fields?.commodity && fields?.weightDims);
-}
-
-function buildConfirmationMessage(fields, refNumber, lang) {
-  const origin      = fields.origin.toUpperCase();
-  const destination = fields.destination.toUpperCase();
-  const commodity   = fields.commodity;
-  const weight      = fields.weightDims;
-  const ref         = refNumber || '---';
-  const msgs = {
-    en: `Just to confirm your inquiry (${ref}): ${commodity} from ${origin} to ${destination}, ${weight}. Is that correct? Our team will be in touch shortly.`,
-    es: `Solo para confirmar su consulta (${ref}): ${commodity} de ${origin} a ${destination}, ${weight}. ¿Es correcto? Nuestro equipo estará en contacto en breve.`,
-    pt: `Só para confirmar sua consulta (${ref}): ${commodity} de ${origin} para ${destination}, ${weight}. Está correto? Nossa equipe entrará em contato em breve.`
-  };
-  return msgs[lang] || msgs.en;
 }
 
 async function sendWhatsApp(to, body) {
@@ -79,15 +77,6 @@ async function sendWhatsApp(to, body) {
   return msg.sid;
 }
 
-function getAttachmentAck(lang) {
-  return {
-    es: 'Recibi tu archivo. Lo paso a nuestro equipo ahora.',
-    pt: 'Recebi seu arquivo. Vou encaminha-lo para nossa equipe agora.',
-    en: 'Got your file. Let me pass that along to our team.'
-  }[lang] || 'Got your file. Let me pass that along to our team.';
-}
-
-// ── Time-ago helper ──
 function timeAgo(ms) {
   const diff = Date.now() - ms;
   const mins = Math.floor(diff / 60000);
@@ -97,10 +86,9 @@ function timeAgo(ms) {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-// ── Is it 8am Miami time? ──
 function isMorningBriefingTime() {
   const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false });
-  return now.startsWith('08:0'); // fires between 08:00 and 08:09
+  return now.startsWith('08:0');
 }
 
 // ─── Background scanners ───────────────────────────────────────────────────────
@@ -129,22 +117,14 @@ setInterval(async () => {
           await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
         }
 
-        // ── SLA breach scanner — AOG only ──
+        // ── SLA breach scanner ──
         if (mem.highestTier === 1 && mem.inquiryQualified && !mem.slaAlertSent) {
           const aogAge = Date.now() - (mem.aogCreatedAt || mem.lastMessageAt);
           if (aogAge >= SLA_AOG_MS) {
-            // Check if an agent has taken over
-            const chatwootConvId = mem.chatwootConvId;
-            const takeover = chatwootConvId ? await getTakeover(chatwootConvId) : null;
+            const takeover = mem.chatwootConvId ? await getTakeover(mem.chatwootConvId) : null;
             if (!takeover?.active) {
               console.log(`[SLA] AOG breach — no agent response in 15min for ${phone}`);
-              // Send urgent SLA breach email
-              await sendEmailAlert(1, phone, mem.messages, mem.refNumber, {
-                origin: mem.lastFields?.origin,
-                destination: mem.lastFields?.destination,
-                commodity: mem.lastFields?.commodity,
-                weightDims: mem.lastFields?.weightDims
-              }, false, true); // true = sla breach
+              await sendEmailAlert(1, phone, mem.messages, mem.refNumber, mem.lastFields || {}, false, true);
               mem.slaAlertSent = true;
               await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
             }
@@ -171,7 +151,7 @@ setInterval(async () => {
       } catch (err) { console.error('[Scanner] Error processing key:', err.message); }
     }
 
-    // ── Morning briefing — fires once at 8am Miami ──
+    // ── Morning briefing ──
     const today = new Date().toLocaleDateString('en-US', { timeZone: 'America/New_York' });
     if (isMorningBriefingTime() && morningBriefingSentToday !== today && allInquiries.length > 0) {
       morningBriefingSentToday = today;
@@ -187,7 +167,6 @@ app.post('/webhook', async (req, res) => {
   res.set('Content-Type', 'text/xml');
   res.send('<Response></Response>');
 
-  // Twilio signature validation
   const twilioSig  = req.headers['x-twilio-signature'];
   const webhookUrl = `${process.env.WEBHOOK_BASE_URL || 'https://atw-whatsapp-bot-production.up.railway.app'}/webhook`;
   const isValid    = twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, twilioSig, webhookUrl, req.body);
@@ -229,7 +208,7 @@ app.post('/webhook', async (req, res) => {
 
     if (text && TEST_PATTERNS.test(text)) {
       mem.isTestConversation = true;
-      console.log(`[Test] Novelty/test opener detected from ${from} — CRM/email deferred`);
+      console.log(`[Test] Novelty/test opener from ${from} — CRM/email deferred`);
     }
   }
 
@@ -266,12 +245,12 @@ app.post('/webhook', async (req, res) => {
     if (tc?.active) {
       if (now - tc.lastAgentMessage <= TAKEOVER_RESUME) return;
       await delTakeover(chatwootConvId);
-      console.log(`[Takeover] Auto-resumed for conv ${chatwootConvId}`);
     }
     const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
     mem.language = await detectLanguage(recentText);
+    const ack = await translateSystemMessage(T.attachmentAck, mem.language);
     await setMem(from, mem);
-    await sendWhatsApp(from, getAttachmentAck(mem.language));
+    await sendWhatsApp(from, ack);
     return;
   }
 
@@ -279,7 +258,7 @@ app.post('/webhook', async (req, res) => {
   if (chatwootConvId) {
     const ts = await getTakeover(chatwootConvId);
     if (ts?.active) {
-      if (now - ts.lastAgentMessage > TAKEOVER_RESUME) { await delTakeover(chatwootConvId); console.log(`[Takeover] Auto-resumed for conv ${chatwootConvId}`); }
+      if (now - ts.lastAgentMessage > TAKEOVER_RESUME) { await delTakeover(chatwootConvId); }
       else { await sendChatwootMessage(chatwootConvId, text || '[attachment]', 'incoming'); return; }
     }
   }
@@ -289,16 +268,15 @@ app.post('/webhook', async (req, res) => {
 
   mem.messages.push({ role: 'user', content: text });
   if (mem.messages.length > MEMORY_LIMIT * 2) mem.messages = mem.messages.slice(-MEMORY_LIMIT * 2);
-  try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
 
-  // ── Compliance disclaimer ──
+  // ── Detect language ──
+  try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
+  console.log(`[Lang] Detected: ${mem.language} for ${from}`);
+
+  // ── Compliance disclaimer — translated dynamically ──
   let pendingDisclaimer = null;
   if (!mem.disclaimerSent) {
-    pendingDisclaimer = {
-      es: 'ATW es un agente de carga autorizado. Al comunicarse con nosotros, usted acepta que su carga sea inspeccionada de acuerdo con las regulaciones de la TSA y el Departamento de Seguridad Nacional. ATW se reserva el derecho de modificar la ruta o mejorar la clase de reserva para cumplir con su ETA si los arreglos originales son cancelados o modificados, sin penalidades. Para asistencia urgente llame al ' + ATW_PHONE + '. Las respuestas pueden ser monitoreadas por control de calidad y cumplimiento.',
-      pt: 'ATW é um despachante aduaneiro licenciado. Ao nos contatar, você consente com a triagem de carga em conformidade com os regulamentos da TSA e do Departamento de Segurança Interna. ATW reserva-se o direito de modificar o roteiro ou atualizar a classe de reserva para cumprir seu ETA se os arranjos originais forem cancelados ou modificados, sem penalidades. Para assistência urgente ligue para ' + ATW_PHONE + '. As respostas podem ser monitoradas para fins de qualidade e conformidade.',
-      en: 'ATW is a licensed freight forwarder. By engaging with us, you consent to cargo screening in compliance with TSA and Department of Homeland Security regulations. ATW reserves the right to modify routing or upgrade booking class to meet your ETA if original arrangements are cancelled or modified, without penalties. For urgent assistance call ' + ATW_PHONE + '. Replies may be monitored for quality and compliance.'
-    }[mem.language] || 'ATW is a licensed freight forwarder. By engaging with us, you consent to cargo screening in compliance with TSA and Department of Homeland Security regulations. ATW reserves the right to modify routing or upgrade booking class to meet your ETA if original arrangements are cancelled or modified, without penalties. For urgent assistance call ' + ATW_PHONE + '. Replies may be monitored for quality and compliance.';
+    pendingDisclaimer = await translateSystemMessage(T.disclaimer, mem.language);
     mem.disclaimerSent = true;
   }
 
@@ -310,11 +288,13 @@ app.post('/webhook', async (req, res) => {
   if (isLiveAgentRequest) {
     mem.liveAgentRequested = true;
     console.log(`[LiveAgent] Request detected from ${from}`);
-    const liveReply = { es: 'Claro, con gusto te conecto con uno de nuestros especialistas. Un miembro del equipo estara contigo en breve.', pt: 'Claro, vou conecta-lo com um de nossos especialistas. Um membro da equipe estara com voce em breve.', en: 'Of course, let me connect you with one of our team members. A specialist will be with you shortly.' }[mem.language] || 'Of course, let me connect you with one of our team members. A specialist will be with you shortly.';
+    const liveReply = await translateSystemMessage(T.liveAgentReply, mem.language);
     await sendWhatsApp(from, liveReply);
     if (chatwootConvId) {
       await sendChatwootMessage(chatwootConvId, liveReply, 'outgoing');
-      await sendChatwootMessage(chatwootConvId, `LIVE AGENT REQUESTED\nPhone: ${from.replace('whatsapp:', '')}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`, 'outgoing', true);
+      await sendChatwootMessage(chatwootConvId,
+        `LIVE AGENT REQUESTED\nPhone: ${from.replace('whatsapp:', '')}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`,
+        'outgoing', true);
     }
     const fields = await extractFields(mem.messages).catch(() => ({}));
     await sendEmailAlert(mem.highestTier || 3, from, mem.messages, mem.refNumber, fields, true);
@@ -327,7 +307,10 @@ app.post('/webhook', async (req, res) => {
   const systemPrompt = buildSystemPrompt(mem.customerName, inquiryHistory, mem.refNumber);
   let reply;
   try { reply = await callClaude(mem.messages, systemPrompt); }
-  catch (err) { console.error('[Claude] Error:', err.message); reply = `I'm having a technical issue. Please call us at ${ATW_PHONE} for immediate assistance.`; }
+  catch (err) {
+    console.error('[Claude] Error:', err.message);
+    reply = await translateSystemMessage(T.technicalError, mem.language);
+  }
   if (!reply) return;
 
   mem.messages.push({ role: 'assistant', content: reply });
@@ -339,7 +322,7 @@ app.post('/webhook', async (req, res) => {
   const isEscalation = tier < prevHighest;
   if (isEscalation) {
     mem.highestTier = tier;
-    if (tier === 1 && !mem.aogCreatedAt) mem.aogCreatedAt = now; // start SLA clock
+    if (tier === 1 && !mem.aogCreatedAt) mem.aogCreatedAt = now;
     console.log(`[Tier] Escalation: ${prevHighest} -> ${tier}`);
   } else { console.log(`[Tier] ${tier} for: "${text.slice(0, 60)}"`); }
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
@@ -351,8 +334,8 @@ app.post('/webhook', async (req, res) => {
 
   // ── Send reply ──
   if (mem.refNumber && !mem.refSentToCustomer) {
-    const langAck = { es: `Tu numero de referencia es ${mem.refNumber}. Guardalo para cualquier seguimiento.`, pt: `Seu numero de referencia e ${mem.refNumber}. Guarde-o para qualquier acompanhamento.`, en: `I've logged your inquiry under reference number ${mem.refNumber}. Please keep this handy for any follow-up.` }[mem.language] || `I've logged your inquiry under reference number ${mem.refNumber}. Please keep this handy for any follow-up.`;
-    const refReply = `${reply}\n\n${langAck}`;
+    const refAck   = await translateSystemMessage(T.refAck(mem.refNumber), mem.language);
+    const refReply = `${reply}\n\n${refAck}`;
     mem.refSentToCustomer = true;
     await sendWhatsApp(from, refReply);
     if (chatwootConvId) await sendChatwootMessage(chatwootConvId, refReply, 'outgoing');
@@ -369,7 +352,6 @@ app.post('/webhook', async (req, res) => {
     try { fields = await extractFields(mem.messages); console.log(`[Extract] Fields: ${JSON.stringify(fields)}`); }
     catch (err) { console.error('[Extract] Failed:', err.message); }
 
-    // Store latest fields for morning briefing + SLA scanner
     if (Object.keys(fields).length) mem.lastFields = fields;
 
     const messageCount = mem.messages.filter(m => m.role === 'user').length;
@@ -399,17 +381,17 @@ app.post('/webhook', async (req, res) => {
         }
       } catch (err) { console.error('[Enrich] Failed:', err.message); }
 
-      // ── Confirmation summary — send once all fields are collected ──
+      // ── Confirmation summary ──
       if (!mem.confirmationSent && hasAllFields(fields)) {
-        const confirmation = buildConfirmationMessage(fields, mem.refNumber, mem.language);
+        const confirmation = await translateSystemMessage(T.confirmSummary(fields, mem.refNumber), mem.language);
         await sendWhatsApp(from, confirmation);
         if (chatwootConvId) await sendChatwootMessage(chatwootConvId, confirmation, 'outgoing');
         mem.confirmationSent = true;
-        console.log(`[Confirm] Summary sent to ${from}`);
+        console.log(`[Confirm] Summary sent to ${from} in ${mem.language}`);
       }
 
     } else {
-      console.log(`[Qualify] Not yet qualified (tier:${effectiveTier}, signals: origin:${!!fields?.origin} dest:${!!fields?.destination} commodity:${!!fields?.commodity} msgs:${messageCount}) — CRM/Monday deferred`);
+      console.log(`[Qualify] Not yet qualified (tier:${effectiveTier}, origin:${!!fields?.origin} dest:${!!fields?.destination} commodity:${!!fields?.commodity} msgs:${messageCount})`);
     }
 
     await setMem(from, mem);
@@ -444,7 +426,11 @@ app.post('/chatwoot-webhook', async (req, res) => {
       if (mem.mondayItemId) updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err => console.error('[Monday] Final update failed:', err.message));
       if (mem.twentyInquiryId) updateTwentyInquiry(mem.twentyInquiryId, { status: 'CLOSED_AGENT', transcript }).catch(err => console.error('[Twenty] #done update failed:', err.message));
       if (!mem.emailSent && mem.highestTier && mem.highestTier < 3 && mem.inquiryQualified) {
-        extractFields(mem.messages).then(fields => { sendEmailAlert(mem.highestTier, to, mem.messages, mem.refNumber, fields); mem.emailSent = true; setMem(to, mem); }).catch(err => console.error('[Email] #done email failed:', err.message));
+        extractFields(mem.messages).then(fields => {
+          sendEmailAlert(mem.highestTier, to, mem.messages, mem.refNumber, fields);
+          mem.emailSent = true;
+          setMem(to, mem);
+        }).catch(err => console.error('[Email] #done email failed:', err.message));
       }
     }
     await delTakeover(convId);
@@ -469,9 +455,9 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.32 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.33 — online'));
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 await redis.connect();
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.32 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.33 running on port ${PORT}`));
