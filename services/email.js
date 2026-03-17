@@ -30,27 +30,29 @@ async function generateSpanishSummary(messages) {
   } catch { return null; }
 }
 
-export async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAgentRequest = false) {
-  if (tier === 3 && !isLiveAgentRequest) return;
+export async function sendEmailAlert(tier, phone, messages, refNumber, fields, isLiveAgentRequest = false, isSLABreach = false) {
+  if (tier === 3 && !isLiveAgentRequest && !isSLABreach) return;
 
   const cleanPhone  = phone.replace('whatsapp:', '');
   const isAOG       = tier === 1;
   const ref         = refNumber || '---';
 
-  const subject     = isLiveAgentRequest
-    ? `AGENTE EN VIVO SOLICITADO / LIVE AGENT REQUESTED [${ref}] — WhatsApp ${cleanPhone}`
-    : isAOG
-      ? `EMERGENCIA AOG / AOG EMERGENCY [${ref}] — WhatsApp ${cleanPhone}`
-      : `Nueva Consulta / New Inquiry [${ref}] — WhatsApp ${cleanPhone}`;
+  const subject     = isSLABreach
+    ? `⚠ SLA BREACH — AOG NO ATENDIDO / UNATTENDED AOG [${ref}] — WhatsApp ${cleanPhone}`
+    : isLiveAgentRequest
+      ? `AGENTE EN VIVO SOLICITADO / LIVE AGENT REQUESTED [${ref}] — WhatsApp ${cleanPhone}`
+      : isAOG
+        ? `EMERGENCIA AOG / AOG EMERGENCY [${ref}] — WhatsApp ${cleanPhone}`
+        : `Nueva Consulta / New Inquiry [${ref}] — WhatsApp ${cleanPhone}`;
 
-  const accentColor = isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#003366';
-  const badgeColor  = isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#0055A4';
+  const accentColor = isSLABreach ? '#8B0000' : isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#003366';
+  const badgeColor  = isSLABreach ? '#8B0000' : isLiveAgentRequest ? '#FF6600' : isAOG ? '#CC0000' : '#0055A4';
 
-  const badgeEN     = isLiveAgentRequest ? 'LIVE AGENT REQUESTED' : isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
-  const badgeES     = isLiveAgentRequest ? 'AGENTE EN VIVO SOLICITADO' : isAOG ? 'TIER 1 — EMERGENCIA AOG' : 'TIER 2 — CONSULTA ESTÁNDAR';
+  const badgeEN     = isSLABreach ? 'SLA BREACH — AOG UNATTENDED 15+ MIN' : isLiveAgentRequest ? 'LIVE AGENT REQUESTED' : isAOG ? 'TIER 1 — AOG EMERGENCY' : 'TIER 2 — STANDARD INQUIRY';
+  const badgeES     = isSLABreach ? 'INCUMPLIMIENTO SLA — AOG SIN ATENDER +15 MIN' : isLiveAgentRequest ? 'AGENTE EN VIVO SOLICITADO' : isAOG ? 'TIER 1 — EMERGENCIA AOG' : 'TIER 2 — CONSULTA ESTÁNDAR';
 
-  const urgencyEN   = isLiveAgentRequest ? 'LIVE AGENT' : isAOG ? 'AOG / CRITICAL' : 'STANDARD';
-  const urgencyES   = isLiveAgentRequest ? 'AGENTE EN VIVO' : isAOG ? 'AOG / CRÍTICO' : 'ESTÁNDAR';
+  const urgencyEN   = isSLABreach ? 'CRITICAL — SLA BREACH' : isLiveAgentRequest ? 'LIVE AGENT' : isAOG ? 'AOG / CRITICAL' : 'STANDARD';
+  const urgencyES   = isSLABreach ? 'CRÍTICO — INCUMPLIMIENTO SLA' : isLiveAgentRequest ? 'AGENTE EN VIVO' : isAOG ? 'AOG / CRÍTICO' : 'ESTÁNDAR';
 
   const origin      = fields?.origin      || '---';
   const destination = fields?.destination || '---';
