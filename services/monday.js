@@ -41,7 +41,12 @@ export async function createMondayItem(phone, tier, mem, fields) {
   const itemName    = mem.refNumber ? `${mem.refNumber} — ${displayName}` : displayName;
   const today       = new Date().toISOString().split('T')[0];
   const now         = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+
+  // Build enriched transcript with new fields appended
   const transcript  = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
+  const fieldSummary = buildFieldSummary(fields);
+  const fullConversation = fieldSummary ? `${transcript}\n\n---\n${fieldSummary}` : transcript;
+
   const columnValues = JSON.stringify({
     [MONDAY_COLS.phone]:        cleanPhone,
     [MONDAY_COLS.reference]:    mem.refNumber || '',
@@ -50,8 +55,9 @@ export async function createMondayItem(phone, tier, mem, fields) {
     [MONDAY_COLS.source]:       'WhatsApp Bot',
     [MONDAY_COLS.status]:       { label: 'Working on it' },
     [MONDAY_COLS.date]:         { date: today },
-    [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}`
+    [MONDAY_COLS.conversation]: `[${now} ET]\n\n${fullConversation}`
   });
+
   const result = await withRetry(() => mondayQuery(
     `mutation CreateItem($boardId: ID!, $itemName: String!, $columnValues: JSON!) {
       create_item(board_id: $boardId, item_name: $itemName, column_values: $columnValues) { id }
@@ -83,15 +89,21 @@ export async function enrichRecords(mem, phone, fields, isEscalation) {
   const cleanPhone = phone.replace('whatsapp:', '');
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const newName    = bestName(mem, fields, cleanPhone);
+  const fieldSummary = buildFieldSummary(fields);
+  const fullConversation = fieldSummary ? `${transcript}\n\n---\n${fieldSummary}` : transcript;
 
   // ── Update Twenty ──
   if (mem.twentyInquiryId) {
     const updates = { transcript };
-    if (fields?.origin)      updates.origin      = fields.origin;
-    if (fields?.destination) updates.destination = fields.destination;
-    if (fields?.commodity)   updates.commodity   = fields.commodity;
-    if (fields?.weightDims)  updates.weightDims  = fields.weightDims;
-    if (newName)             updates.name        = newName;
+    if (fields?.origin)          updates.origin          = fields.origin;
+    if (fields?.destination)     updates.destination     = fields.destination;
+    if (fields?.commodity)       updates.commodity       = fields.commodity;
+    if (fields?.weightDims)      updates.weightDims      = fields.weightDims;
+    if (fields?.hazmat)          updates.hazmat          = fields.hazmat;
+    if (fields?.transportMode)   updates.transportMode   = fields.transportMode;
+    if (fields?.pickupAddress)   updates.pickupAddress   = fields.pickupAddress;
+    if (fields?.deliveryAddress) updates.deliveryAddress = fields.deliveryAddress;
+    if (newName)                 updates.name            = newName;
     if (isEscalation) { updates.tier = 'AOG_EMERGENCY'; updates.escalated = true; updates.status = 'NEW'; }
     await updateTwentyInquiry(mem.twentyInquiryId, updates);
   }
@@ -99,7 +111,7 @@ export async function enrichRecords(mem, phone, fields, isEscalation) {
   // ── Update Monday ──
   if (mem.mondayItemId) {
     const now = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-    const colUpdates = { [MONDAY_COLS.conversation]: `[${now} ET]\n\n${transcript}` };
+    const colUpdates = { [MONDAY_COLS.conversation]: `[${now} ET]\n\n${fullConversation}` };
     if (isEscalation) {
       colUpdates[MONDAY_COLS.tier]   = { label: 'AOG Emergency' };
       colUpdates[MONDAY_COLS.status] = { label: 'Working on it' };
@@ -117,9 +129,20 @@ export async function enrichRecords(mem, phone, fields, isEscalation) {
     if (isEscalation) {
       await mondayQuery(
         `mutation AddUpdate($itemId: ID!, $body: String!) { create_update(item_id: $itemId, body: $body) { id } }`,
-        { itemId: mem.mondayItemId, body: `ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${transcript}` }
+        { itemId: mem.mondayItemId, body: `ESCALATED TO AOG\nRef: ${mem.refNumber}\n\n${fullConversation}` }
       );
       console.log(`[Monday] Escalation update for item ${mem.mondayItemId}`);
     }
   }
+}
+
+// ── Helper: build a readable field summary block for Monday conversation column ──
+function buildFieldSummary(fields) {
+  if (!fields) return null;
+  const lines = [];
+  if (fields.hazmat)          lines.push(`Hazmat / DG: ${fields.hazmat}`);
+  if (fields.transportMode)   lines.push(`Mode / Modo: ${fields.transportMode}`);
+  if (fields.pickupAddress)   lines.push(`Pickup / Recogida: ${fields.pickupAddress}`);
+  if (fields.deliveryAddress) lines.push(`Delivery / Entrega: ${fields.deliveryAddress}`);
+  return lines.length > 0 ? lines.join('\n') : null;
 }
