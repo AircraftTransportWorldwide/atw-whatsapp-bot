@@ -54,12 +54,16 @@ export async function sendEmailAlert(tier, phone, messages, refNumber, fields, i
   const urgencyEN   = isSLABreach ? 'CRITICAL — SLA BREACH' : isLiveAgentRequest ? 'LIVE AGENT' : isAOG ? 'AOG / CRITICAL' : 'STANDARD';
   const urgencyES   = isSLABreach ? 'CRÍTICO — INCUMPLIMIENTO SLA' : isLiveAgentRequest ? 'AGENTE EN VIVO' : isAOG ? 'AOG / CRÍTICO' : 'ESTÁNDAR';
 
-  const origin      = fields?.origin      || '---';
-  const destination = fields?.destination || '---';
-  const commodity   = fields?.commodity   || '---';
-  const weightDims  = fields?.weightDims  || '---';
-  const company     = fields?.companyName || '---';
-  const contact     = fields?.contactName || '---';
+  const origin          = fields?.origin          || '---';
+  const destination     = fields?.destination     || '---';
+  const commodity       = fields?.commodity       || '---';
+  const weightDims      = fields?.weightDims      || '---';
+  const company         = fields?.companyName     || '---';
+  const contact         = fields?.contactName     || '---';
+  const hazmat          = fields?.hazmat          || '---';
+  const transportMode   = fields?.transportMode   || '---';
+  const pickupAddress   = fields?.pickupAddress   || '---';
+  const deliveryAddress = fields?.deliveryAddress || '---';
 
   // Generate both summaries in parallel
   const [summaryEN, summaryES] = await Promise.all([
@@ -115,7 +119,7 @@ export async function sendEmailAlert(tier, phone, messages, refNumber, fields, i
   <!-- Details table -->
   <tr><td style="padding:0 30px 8px;">
     <table cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e0e0e0;border-radius:4px;border-collapse:collapse;">
-      <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:140px;border-bottom:1px solid #e0e0e0;">Reference / Ref.</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;font-weight:700;">${ref}</td></tr>
+      <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;width:160px;border-bottom:1px solid #e0e0e0;">Reference / Ref.</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;font-weight:700;">${ref}</td></tr>
       <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Client / Cliente</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${cleanPhone}</td></tr>
       <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Company / Empresa</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${company}</td></tr>
       <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Contact / Contacto</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${contact}</td></tr>
@@ -123,6 +127,10 @@ export async function sendEmailAlert(tier, phone, messages, refNumber, fields, i
       <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Destination / Destino</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${destination.toUpperCase()}</td></tr>
       <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Commodity / Mercancía</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${commodity}</td></tr>
       <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Weight/Dims / Peso</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${weightDims}</td></tr>
+      <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Hazmat / Mat. Peligrosa</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${hazmat}</td></tr>
+      <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Mode / Modo</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${transportMode}</td></tr>
+      <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Pickup / Recogida</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${pickupAddress}</td></tr>
+      <tr style="background:#f9f9f9;"><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;border-bottom:1px solid #e0e0e0;">Delivery / Entrega</td><td style="padding:10px 16px;font-size:13px;color:#333;border-bottom:1px solid #e0e0e0;">${deliveryAddress}</td></tr>
       <tr><td style="padding:10px 16px;font-size:13px;font-weight:700;color:#555;">Urgency / Urgencia</td><td style="padding:10px 16px;font-size:13px;color:#333;">${urgencyEN} / ${urgencyES}</td></tr>
     </table>
   </td></tr>
