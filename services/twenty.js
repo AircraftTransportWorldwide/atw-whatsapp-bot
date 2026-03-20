@@ -84,7 +84,9 @@ export async function getInquiryHistory(contactId) {
         edges {
           node {
             id referenceNumber tier status language
-            origin destination commodity weightDims createdAt
+            origin destination commodity weightDims
+            hazmat transportMode pickupAddress deliveryAddress
+            createdAt
           }
         }
       }
@@ -113,10 +115,14 @@ export async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
       status:          'CLOSED_BOT',
       language:        langMap[mem.language] || 'EN',
       escalated:       false,
-      origin:          fields?.origin || '',
-      destination:     fields?.destination || '',
-      commodity:       fields?.commodity || '',
-      weightDims:      fields?.weightDims || '',
+      origin:          fields?.origin          || '',
+      destination:     fields?.destination     || '',
+      commodity:       fields?.commodity       || '',
+      weightDims:      fields?.weightDims      || '',
+      hazmat:          fields?.hazmat          || null,
+      transportMode:   fields?.transportMode   || null,
+      pickupAddress:   fields?.pickupAddress   || '',
+      deliveryAddress: fields?.deliveryAddress || '',
       customerPhone:   cleanPhone,
       transcript:      transcript,
       personId:        contactId
