@@ -94,7 +94,7 @@ export async function extractFields(messages) {
       method: 'POST',
       headers: headers(),
       body: JSON.stringify({
-        model: CLAUDE_MODEL, max_tokens: 300,
+        model: CLAUDE_MODEL, max_tokens: 400,
         system: `You are a data extraction assistant for a freight forwarder. Extract shipment details from the conversation transcript.
 Return ONLY a valid JSON object with these exact keys:
 {
@@ -103,7 +103,11 @@ Return ONLY a valid JSON object with these exact keys:
   "origin": string or null,
   "destination": string or null,
   "commodity": string or null,
-  "weightDims": string or null
+  "weightDims": string or null,
+  "hazmat": "YES" | "NO" | null,
+  "transportMode": "AIR" | "OCEAN" | "GROUND" | null,
+  "pickupAddress": string or null,
+  "deliveryAddress": string or null
 }
 Rules:
 - Use null for any field not clearly mentioned
@@ -113,6 +117,10 @@ Rules:
 - destination: city, airport, or country of shipment destination
 - commodity: what is being shipped (e.g. "hydraulic pump", "aircraft engine")
 - weightDims: weight and/or dimensions if mentioned (e.g. "50lb, 8x8x10in")
+- hazmat: "YES" if customer confirms dangerous goods / hazmat, "NO" if explicitly denied, null if not mentioned
+- transportMode: "AIR" for air freight, "OCEAN" for ocean/sea freight, "GROUND" for truck/ground, null if not mentioned or unclear
+- pickupAddress: full street address for pickup if mentioned (e.g. "1234 NW 25th St, Miami FL 33142")
+- deliveryAddress: full street address for delivery if mentioned
 Return only the JSON object, no explanation, no markdown.`,
         messages: [{ role: 'user', content: transcript }]
       })
@@ -209,12 +217,18 @@ GREETING (use only for new customers with no history):
 LANGUAGE: Detect the customer's language from their first message and respond in that same language throughout the entire conversation. You support all languages fluently.
 
 YOUR JOB:
-Gather the following information naturally through conversation:
+Gather the following information naturally through conversation (for Tier 1 AOG and Tier 2 freight inquiries only):
 - Commodity or cargo description
 - Origin (city/airport/country)
 - Destination (city/airport/country)
 - Weight and dimensions
+- Hazardous materials — ask if the shipment contains any dangerous goods or hazmat
+- Preferred mode of transport — air freight, ocean freight, or ground/truck
+- Exact pickup address (full street address)
+- Exact delivery address (full street address)
 - Urgency level or required delivery date
+
+Ask for these naturally as the conversation flows — do not fire all questions at once. Work them in one or two at a time as appropriate.
 
 STRICT FORMATTING RULES — THIS IS THE MOST IMPORTANT INSTRUCTION:
 - You MUST write in plain prose only. Plain sentences and short paragraphs.
