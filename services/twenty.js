@@ -20,8 +20,78 @@ async function twentyQuery(query, variables = {}) {
   } catch (err) { console.error('[Twenty] Request failed:', err.message); return null; }
 }
 
-export async function findOrCreateContact(phone, name) {
-  const cleanPhone = phone.replace('whatsapp:', '');
+// ── Detect identifier type ────────────────────────────────────────────────────
+function isWebSession(identifier) {
+  return typeof identifier === 'string' && identifier.startsWith('web:');
+}
+
+function isEmail(identifier) {
+  return typeof identifier === 'string' && identifier.includes('@');
+}
+
+// ── Find or create contact (WhatsApp phone OR web email/anonymous) ─────────────
+export async function findOrCreateContact(identifier, name) {
+
+  // ── Web contact with email ──
+  if (isEmail(identifier)) {
+    const email = identifier.toLowerCase().trim();
+    const searchResult = await twentyQuery(`
+      query FindPeopleByEmail($filter: PersonFilterInput) {
+        people(filter: $filter, orderBy: { createdAt: AscNullsLast }, first: 5) {
+          edges { node { id name { firstName lastName } emails { primaryEmail } } }
+        }
+      }
+    `, { filter: { emails: { primaryEmail: { like: `%${email}%` } } } });
+
+    if (searchResult?.people?.edges?.length > 0) {
+      const best = searchResult.people.edges[0].node;
+      const fullName = [best.name.firstName, best.name.lastName].filter(Boolean).join(' ');
+      const contact = { id: best.id, name: fullName || name || null };
+      await setTwentyCache(identifier, contact);
+      console.log(`[Twenty] Found web contact by email: ${contact.name || email}`);
+      return contact;
+    }
+
+    const firstName = name ? name.trim().split(' ')[0] : 'Website';
+    const lastName  = name ? (name.trim().split(' ').slice(1).join(' ') || 'Visitor') : 'Visitor';
+    const createResult = await withRetry(() => twentyQuery(`
+      mutation CreatePeople($data: [PersonCreateInput!]) {
+        createPeople(data: $data) { id name { firstName lastName } }
+      }
+    `, { data: [{ name: { firstName, lastName }, emails: { primaryEmail: email } }] }));
+
+    if (createResult?.createPeople?.[0]) {
+      const contact = { id: createResult.createPeople[0].id, name: name || null };
+      await setTwentyCache(identifier, contact);
+      console.log(`[Twenty] Created web contact by email: ${contact.id}`);
+      return contact;
+    }
+    return null;
+  }
+
+  // ── Anonymous web contact (no email, no phone) ──
+  if (isWebSession(identifier)) {
+    const convId    = identifier.replace('web:', '');
+    const firstName = name ? name.trim().split(' ')[0] : 'Website';
+    const lastName  = name ? (name.trim().split(' ').slice(1).join(' ') || `Visitor #${convId}`) : `Visitor #${convId}`;
+
+    const createResult = await withRetry(() => twentyQuery(`
+      mutation CreatePeople($data: [PersonCreateInput!]) {
+        createPeople(data: $data) { id name { firstName lastName } }
+      }
+    `, { data: [{ name: { firstName, lastName } }] }));
+
+    if (createResult?.createPeople?.[0]) {
+      const contact = { id: createResult.createPeople[0].id, name: name || null };
+      await setTwentyCache(identifier, contact);
+      console.log(`[Twenty] Created anonymous web contact: ${contact.id} (conv:${convId})`);
+      return contact;
+    }
+    return null;
+  }
+
+  // ── WhatsApp phone contact (existing logic) ──
+  const cleanPhone = identifier.replace('whatsapp:', '');
   const digitsOnly = cleanPhone.replace(/\D/g, '');
   const last10     = digitsOnly.slice(-10);
 
@@ -54,7 +124,7 @@ export async function findOrCreateContact(phone, name) {
     }
 
     const contact = { id: best.id, name: isPlaceholder ? (name || null) : fullName };
-    await setTwentyCache(phone, contact);
+    await setTwentyCache(identifier, contact);
     console.log(`[Twenty] Found contact: ${contact.name || cleanPhone}`);
     return contact;
   }
@@ -70,7 +140,7 @@ export async function findOrCreateContact(phone, name) {
 
   if (createResult?.createPeople?.[0]) {
     const contact = { id: createResult.createPeople[0].id, name: name || null };
-    await setTwentyCache(phone, contact);
+    await setTwentyCache(identifier, contact);
     console.log(`[Twenty] Created contact: ${createResult.createPeople[0].id}`);
     return contact;
   }
@@ -95,9 +165,15 @@ export async function getInquiryHistory(contactId) {
   return result?.inquiries?.edges?.map(e => e.node) || [];
 }
 
-export async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
+export async function createTwentyInquiry(contactId, identifier, tier, mem, fields) {
   if (!contactId) return null;
-  const cleanPhone = phone.replace('whatsapp:', '');
+
+  // Determine channel and clean identifier for display
+  const channel    = mem.channel === 'web' ? 'WEB' : 'WHATSAPP';
+  const cleanPhone = isWebSession(identifier) || isEmail(identifier)
+    ? (mem.visitorEmail || `web:${mem.chatwootConvId}`)
+    : identifier.replace('whatsapp:', '');
+
   const tierValue  = tier === 1 ? 'AOG_EMERGENCY' : 'FREIGHT_INQUIRY';
   const transcript = mem.messages.map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
   const langMap    = { en: 'EN', es: 'ES', pt: 'PT' };
@@ -114,6 +190,7 @@ export async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
       tier:            tierValue,
       status:          'CLOSED_BOT',
       language:        langMap[mem.language] || 'EN',
+      channel:         channel,
       escalated:       false,
       origin:          fields?.origin          || '',
       destination:     fields?.destination     || '',
@@ -130,7 +207,7 @@ export async function createTwentyInquiry(contactId, phone, tier, mem, fields) {
   }));
 
   if (result?.createInquiry) {
-    console.log(`[Twenty] Created inquiry: ${result.createInquiry.id} (${mem.refNumber})`);
+    console.log(`[Twenty] Created ${channel} inquiry: ${result.createInquiry.id} (${mem.refNumber})`);
     return result.createInquiry.id;
   }
   return null;
