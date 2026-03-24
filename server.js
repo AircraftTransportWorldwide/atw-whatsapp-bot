@@ -254,9 +254,24 @@ app.post('/webhook', async (req, res) => {
     }
     const recentText = mem.messages.filter(m => m.role === 'user').slice(-3).map(m => m.content).join(' ') || text || 'hello';
     mem.language = await detectLanguage(recentText);
-    const ack = await translateSystemMessage(T.attachmentAck, mem.language);
+
+    // ── Smart media-type response ──
+    let mediaAck;
+    const mt = (mediaType || '').toLowerCase();
+    if (mt.startsWith('audio/') || mt.includes('ogg') || mt.includes('mpeg') || mt.includes('mp4') || mt.includes('amr')) {
+      mediaAck = `I received your voice message, but I'm not able to listen to audio at the moment. Please type your inquiry and I'll be happy to help — or call us directly at ${ATW_PHONE} for immediate assistance.`;
+    } else if (mt.startsWith('image/')) {
+      mediaAck = T.attachmentAck;
+    } else if (mt.includes('pdf') || mt.includes('msword') || mt.includes('document') || mt.includes('spreadsheet') || mt.includes('text')) {
+      mediaAck = `Got your document — I've forwarded it to our team. If this is related to an urgent shipment, please type the details here so I can assist you right away.`;
+    } else {
+      mediaAck = T.attachmentAck;
+    }
+
+    const translatedAck = await translateSystemMessage(mediaAck, mem.language);
     await setMem(from, mem);
-    await sendWhatsApp(from, ack);
+    await sendWhatsApp(from, translatedAck);
+    if (chatwootConvId) await sendChatwootMessage(chatwootConvId, translatedAck, 'outgoing');
     return;
   }
 
