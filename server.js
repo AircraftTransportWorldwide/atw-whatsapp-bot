@@ -1,4 +1,4 @@
-// ATW WhatsApp Bot v10.33 — server.js
+// ATW WhatsApp Bot v10.34 — server.js
 // Clean entry point — routes and orchestration only
 // All logic lives in /services and /utils
 
@@ -31,6 +31,9 @@ import { sendMorningBriefing } from './services/morning.js';
 const app          = express();
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const FROM_NUMBER  = process.env.TWILIO_WHATSAPP_NUMBER;
+
+// ── Website inbox ID (set in Railway env) ──
+const WEBSITE_INBOX_ID = parseInt(process.env.CHATWOOT_WEBSITE_INBOX_ID || '0', 10);
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
@@ -96,23 +99,26 @@ let morningBriefingSentToday = null;
 
 setInterval(async () => {
   try {
-    const keys = await redis.keys('mem:whatsapp:*');
+    // Scan both WhatsApp and website sessions
+    const waKeys  = await redis.keys('mem:whatsapp:*');
+    const webKeys = await redis.keys('mem:web:*');
+    const allKeys = [...waKeys, ...webKeys];
     const allInquiries = [];
 
-    for (const key of keys) {
+    for (const key of allKeys) {
       try {
         const raw = await redis.get(key);
         if (!raw) continue;
-        const mem = JSON.parse(raw);
-        const phone = key.replace('mem:', '');
+        const mem   = JSON.parse(raw);
+        const memId = key.replace('mem:', ''); // e.g. whatsapp:+1305... or web:123
 
         // ── Idle email scanner ──
         if (!mem.emailSent && mem.highestTier && mem.highestTier < 3 &&
             mem.lastMessageAt && Date.now() - mem.lastMessageAt >= INACTIVITY_MS &&
             mem.messages?.length && mem.inquiryQualified) {
-          console.log(`[Idle] Conversation idle for ${phone} — sending email`);
+          console.log(`[Idle] Conversation idle for ${memId} — sending email`);
           const fields = await extractFields(mem.messages);
-          await sendEmailAlert(mem.highestTier, phone, mem.messages, mem.refNumber, fields);
+          await sendEmailAlert(mem.highestTier, memId, mem.messages, mem.refNumber, fields);
           mem.emailSent = true;
           await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
         }
@@ -123,8 +129,8 @@ setInterval(async () => {
           if (aogAge >= SLA_AOG_MS) {
             const takeover = mem.chatwootConvId ? await getTakeover(mem.chatwootConvId) : null;
             if (!takeover?.active) {
-              console.log(`[SLA] AOG breach — no agent response in 15min for ${phone}`);
-              await sendEmailAlert(1, phone, mem.messages, mem.refNumber, mem.lastFields || {}, false, true);
+              console.log(`[SLA] AOG breach — no agent response in 15min for ${memId}`);
+              await sendEmailAlert(1, memId, mem.messages, mem.refNumber, mem.lastFields || {}, false, true);
               mem.slaAlertSent = true;
               await redis.set(key, JSON.stringify(mem), { KEEPTTL: true });
             }
@@ -135,7 +141,7 @@ setInterval(async () => {
         if (mem.inquiryQualified && mem.highestTier < 3 && mem.lastMessageAt &&
             Date.now() - mem.lastMessageAt < 24 * 60 * 60 * 1000) {
           allInquiries.push({
-            phone: phone.replace('whatsapp:', ''),
+            phone: mem.channel === 'web' ? `web:${mem.chatwootConvId}` : memId.replace('whatsapp:', ''),
             tier: mem.highestTier,
             refNumber: mem.refNumber,
             language: mem.language,
@@ -192,7 +198,7 @@ app.post('/webhook', async (req, res) => {
     lastMessageAt: null, liveAgentRequested: false, disclaimerSent: false,
     inquiryQualified: false, isTestConversation: false,
     confirmationSent: false, aogCreatedAt: null, slaAlertSent: false,
-    chatwootConvId: null, lastFields: {}
+    chatwootConvId: null, lastFields: {}, channel: 'whatsapp'
   };
 
   if (profileName?.trim()) mem.profileName = profileName.trim();
@@ -204,7 +210,7 @@ app.post('/webhook', async (req, res) => {
     mem.highestTier = 3; mem.liveAgentRequested = false; mem.disclaimerSent = false;
     mem.inquiryQualified = false; mem.isTestConversation = false;
     mem.confirmationSent = false; mem.aogCreatedAt = null; mem.slaAlertSent = false;
-    mem.lastFields = {};
+    mem.lastFields = {}; mem.channel = 'whatsapp';
 
     if (text && TEST_PATTERNS.test(text)) {
       mem.isTestConversation = true;
@@ -398,52 +404,297 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ─── Chatwoot webhook ──────────────────────────────────────────────────────────
+// ─── Chatwoot website widget webhook ──────────────────────────────────────────
+// Handles incoming messages from website visitors on atwcargo.com
+app.post('/chatwoot-website-webhook', async (req, res) => {
+  res.sendStatus(200);
+
+  const { event, message_type, content, conversation, sender } = req.body;
+
+  // Only process incoming messages from website visitors
+  if (event !== 'message_created' || message_type !== 'incoming') return;
+
+  // Verify this is from the correct website inbox
+  const inboxId = conversation?.inbox_id;
+  if (WEBSITE_INBOX_ID && inboxId !== WEBSITE_INBOX_ID) return;
+
+  const convId = conversation?.id;
+  if (!convId) return;
+
+  const text = sanitizeInput(content);
+  if (!text) return;
+
+  // Session key uses conversation ID — no phone number for website visitors
+  const sessionKey = `web:${convId}`;
+  console.log(`[Web] conv:${convId} — ${text}`);
+
+  // ── Takeover check ──
+  const ts = await getTakeover(convId);
+  if (ts?.active) {
+    if (Date.now() - ts.lastAgentMessage > TAKEOVER_RESUME) {
+      await delTakeover(convId);
+    } else {
+      // Agent is in control — do nothing, visitor message already in Chatwoot
+      return;
+    }
+  }
+
+  const now = Date.now();
+  let mem = await getMem(sessionKey);
+  const isFirstMessage = !mem || mem.messages.length === 0;
+
+  if (!mem) mem = {
+    messages: [], customerName: null, profileName: null,
+    twentyContactId: null, twentyInquiryId: null, inquiryCreated: false,
+    emailSent: false, mondayItemId: null,
+    language: 'en', highestTier: 3,
+    refNumber: null, refSentToCustomer: false,
+    lastMessageAt: null, liveAgentRequested: false, disclaimerSent: false,
+    inquiryQualified: false, isTestConversation: false,
+    confirmationSent: false, aogCreatedAt: null, slaAlertSent: false,
+    chatwootConvId: convId, lastFields: {}, channel: 'web',
+    visitorName: null, visitorEmail: null
+  };
+
+  // Capture visitor identity if provided by Chatwoot
+  if (sender?.name && sender.name !== 'Visitor' && !mem.visitorName) {
+    mem.visitorName = sender.name;
+    if (!mem.customerName) mem.customerName = sender.name;
+  }
+  if (sender?.email && !mem.visitorEmail) mem.visitorEmail = sender.email;
+
+  mem.lastMessageAt = now;
+  mem.chatwootConvId = convId;
+
+  if (isFirstMessage) {
+    mem.mondayItemId = null; mem.twentyInquiryId = null; mem.inquiryCreated = false;
+    mem.emailSent = false; mem.refNumber = null; mem.refSentToCustomer = false;
+    mem.highestTier = 3; mem.liveAgentRequested = false; mem.disclaimerSent = false;
+    mem.inquiryQualified = false; mem.isTestConversation = false;
+    mem.confirmationSent = false; mem.aogCreatedAt = null; mem.slaAlertSent = false;
+    mem.lastFields = {};
+
+    if (text && TEST_PATTERNS.test(text)) {
+      mem.isTestConversation = true;
+      console.log(`[WebTest] Novelty opener on conv ${convId} — CRM/email deferred`);
+    }
+
+    console.log(`[Web] New website visitor — conv:${convId} name:${mem.visitorName || 'unknown'}`);
+  }
+
+  mem.messages.push({ role: 'user', content: text });
+  if (mem.messages.length > MEMORY_LIMIT * 2) mem.messages = mem.messages.slice(-MEMORY_LIMIT * 2);
+
+  // ── Detect language ──
+  try { mem.language = await detectLanguage(text); } catch { /* keep existing */ }
+  console.log(`[Lang] Web conv:${convId} — ${mem.language}`);
+
+  // ── Compliance disclaimer ──
+  let pendingDisclaimer = null;
+  if (!mem.disclaimerSent) {
+    pendingDisclaimer = await translateSystemMessage(T.disclaimer, mem.language);
+    mem.disclaimerSent = true;
+  }
+
+  // ── Live agent detection ──
+  let isLiveAgentRequest = false;
+  if (!mem.liveAgentRequested) {
+    try { isLiveAgentRequest = await detectLiveAgentRequest(text); } catch { /* skip */ }
+  }
+  if (isLiveAgentRequest) {
+    mem.liveAgentRequested = true;
+    console.log(`[LiveAgent] Web visitor on conv:${convId} requested live agent`);
+    const liveReply = await translateSystemMessage(T.liveAgentReply, mem.language);
+    await sendChatwootMessage(convId, liveReply, 'outgoing');
+    await sendChatwootMessage(convId,
+      `LIVE AGENT REQUESTED\nChannel: Website\nConversation: #${convId}\nVisitor: ${mem.visitorName || 'Anonymous'}${mem.visitorEmail ? ` <${mem.visitorEmail}>` : ''}\nRef: ${mem.refNumber || 'not assigned'}\nLanguage: ${mem.language?.toUpperCase() || 'EN'}\nUse #takeover to take control.`,
+      'outgoing', true);
+    const fields = await extractFields(mem.messages).catch(() => ({}));
+    await sendEmailAlert(mem.highestTier || 3, `web:${convId}`, mem.messages, mem.refNumber, fields, true);
+    mem.messages.push({ role: 'assistant', content: liveReply });
+    await setMem(sessionKey, mem);
+    return;
+  }
+
+  // ── Inquiry history for returning contacts ──
+  let inquiryHistory = [];
+  if (mem.visitorEmail && !mem.twentyContactId) {
+    try {
+      const contact = await findOrCreateContact(mem.visitorEmail, mem.visitorName || null);
+      if (contact) {
+        mem.twentyContactId = contact.id;
+        if (contact.name && !mem.customerName) mem.customerName = contact.name;
+        inquiryHistory = await getInquiryHistory(contact.id);
+        if (inquiryHistory.length > 0 && isFirstMessage) {
+          console.log(`[Twenty] Web returning visitor — ${inquiryHistory.length} past inquiries`);
+        }
+      }
+    } catch (err) { console.error('[Twenty] Web contact lookup failed:', err.message); }
+  }
+
+  // ── Claude response ──
+  const systemPrompt = buildSystemPrompt(mem.customerName, inquiryHistory, mem.refNumber);
+  let reply;
+  try { reply = await callClaude(mem.messages, systemPrompt); }
+  catch (err) {
+    console.error('[Claude] Web error:', err.message);
+    reply = await translateSystemMessage(T.technicalError, mem.language);
+  }
+  if (!reply) return;
+
+  mem.messages.push({ role: 'assistant', content: reply });
+  await setMem(sessionKey, mem);
+
+  // ── Tier classification ──
+  const tier         = await classifyTier(text);
+  const prevHighest  = mem.highestTier || 3;
+  const isEscalation = tier < prevHighest;
+  if (isEscalation) {
+    mem.highestTier = tier;
+    if (tier === 1 && !mem.aogCreatedAt) mem.aogCreatedAt = now;
+    console.log(`[Tier] Web escalation: ${prevHighest} -> ${tier}`);
+  }
+  const effectiveTier = Math.min(tier, mem.highestTier || 3);
+
+  if (effectiveTier <= 2 && !mem.refNumber) {
+    mem.refNumber = generateRefNumber();
+    console.log(`[Ref] Web generated ${mem.refNumber} for conv:${convId}`);
+  }
+
+  // ── Send reply to Chatwoot widget ──
+  if (mem.refNumber && !mem.refSentToCustomer) {
+    const refAck   = await translateSystemMessage(T.refAck(mem.refNumber), mem.language);
+    const refReply = `${reply}\n\n${refAck}`;
+    mem.refSentToCustomer = true;
+    await sendChatwootMessage(convId, refReply, 'outgoing');
+  } else {
+    const finalReply = pendingDisclaimer ? `${reply}\n\n${pendingDisclaimer}` : reply;
+    await sendChatwootMessage(convId, finalReply, 'outgoing');
+  }
+  await setMem(sessionKey, mem);
+
+  // ── CRM enrichment ──
+  if (effectiveTier <= 2) {
+    let fields = {};
+    try { fields = await extractFields(mem.messages); console.log(`[Extract] Web fields: ${JSON.stringify(fields)}`); }
+    catch (err) { console.error('[Extract] Web failed:', err.message); }
+
+    if (Object.keys(fields).length) mem.lastFields = fields;
+
+    const messageCount = mem.messages.filter(m => m.role === 'user').length;
+    const qualified    = isQualifiedInquiry(effectiveTier, fields, messageCount);
+
+    if (qualified && mem.isTestConversation) {
+      mem.isTestConversation = false;
+      console.log(`[WebTest] Conv:${convId} graduated to real inquiry`);
+    }
+
+    if (qualified && !mem.inquiryQualified) {
+      mem.inquiryQualified = true;
+      console.log(`[Qualify] Web conv:${convId} now qualified — creating CRM/Monday records`);
+    }
+
+    if (mem.inquiryQualified) {
+      try {
+        // Use email as identifier for Twenty CRM, fall back to web:convId
+        const crmIdentifier = mem.visitorEmail || `web:${convId}`;
+        if (!mem.twentyContactId) {
+          const contact = await findOrCreateContact(crmIdentifier, mem.visitorName || `Website Visitor #${convId}`);
+          if (contact) { mem.twentyContactId = contact.id; }
+        }
+        if (!mem.inquiryCreated && mem.twentyContactId) {
+          const inquiryId = await createTwentyInquiry(mem.twentyContactId, `web:${convId}`, effectiveTier, mem, fields);
+          if (inquiryId) { mem.twentyInquiryId = inquiryId; mem.inquiryCreated = true; await setMem(sessionKey, mem); }
+        }
+        if (!mem.mondayItemId) {
+          const itemId = await createMondayItem(`web:${convId}`, effectiveTier, mem, fields);
+          if (itemId) { mem.mondayItemId = itemId; await setMem(sessionKey, mem); }
+        } else {
+          await enrichRecords(mem, `web:${convId}`, fields, isEscalation);
+        }
+      } catch (err) { console.error('[Enrich] Web failed:', err.message); }
+
+      // ── Confirmation summary ──
+      if (!mem.confirmationSent && hasAllFields(fields)) {
+        const confirmation = await translateSystemMessage(T.confirmSummary(fields, mem.refNumber), mem.language);
+        await sendChatwootMessage(convId, confirmation, 'outgoing');
+        mem.confirmationSent = true;
+        console.log(`[Confirm] Web summary sent to conv:${convId} in ${mem.language}`);
+      }
+    }
+
+    await setMem(sessionKey, mem);
+  }
+});
+
+// ─── Chatwoot webhook (agent replies — WhatsApp + website) ────────────────────
 app.post('/chatwoot-webhook', async (req, res) => {
   res.sendStatus(200);
   const { event, message_type, content, conversation, private: isPrivate, attachments } = req.body;
   if (isPrivate) return;
   if (event !== 'message_created' || message_type !== 'outgoing') return;
+
   const convId = conversation?.id;
   const phone  = conversation?.meta?.sender?.identifier || conversation?.meta?.sender?.phone_number;
-  if (!phone || !convId) return;
-  const to    = phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
+  if (!convId) return;
+
   const text  = (content || '').trim();
   const msgId = req.body?.message?.id?.toString();
-  if (await isChatwootDuplicate(convId, text, msgId)) { console.log(`[CW Dedup] Skipped duplicate for conv ${convId}`); return; }
 
+  // ── Detect channel: website conv has no phone number ──
+  const isWebConv = !phone || !phone.includes('+');
+
+  // ── #takeover / #done work for both channels ──
   if (text.toLowerCase() === '#takeover') {
     await setTakeover(convId, { active: true, lastAgentMessage: Date.now() });
     await sendChatwootMessage(convId, 'Bot is now paused. You have full control. Type #done to hand back.', 'outgoing', true);
-    console.log(`[Takeover] Agent took over conv ${convId}`);
+    console.log(`[Takeover] Agent took over conv:${convId} (${isWebConv ? 'web' : 'whatsapp'})`);
     return;
   }
 
   if (text.toLowerCase() === '#done') {
-    const mem = await getMem(to);
+    const sessionKey = isWebConv ? `web:${convId}` : `whatsapp:${phone}`;
+    const to         = isWebConv ? null : (phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`);
+    const mem        = await getMem(sessionKey);
+
     if (mem) {
       const transcript = (mem.messages || []).map(m => `${m.role === 'user' ? 'Customer' : 'Patty'}: ${m.content}`).join('\n');
-      if (mem.mondayItemId) updateMondayItem(mem.mondayItemId, to, mem, transcript).catch(err => console.error('[Monday] Final update failed:', err.message));
+      if (mem.mondayItemId)   updateMondayItem(mem.mondayItemId, sessionKey, mem, transcript).catch(err => console.error('[Monday] #done update failed:', err.message));
       if (mem.twentyInquiryId) updateTwentyInquiry(mem.twentyInquiryId, { status: 'CLOSED_AGENT', transcript }).catch(err => console.error('[Twenty] #done update failed:', err.message));
       if (!mem.emailSent && mem.highestTier && mem.highestTier < 3 && mem.inquiryQualified) {
         extractFields(mem.messages).then(fields => {
-          sendEmailAlert(mem.highestTier, to, mem.messages, mem.refNumber, fields);
+          sendEmailAlert(mem.highestTier, sessionKey, mem.messages, mem.refNumber, fields);
           mem.emailSent = true;
-          setMem(to, mem);
+          setMem(sessionKey, mem);
         }).catch(err => console.error('[Email] #done email failed:', err.message));
       }
     }
     await delTakeover(convId);
     await sendChatwootMessage(convId, 'Bot has resumed.', 'outgoing', true);
-    console.log(`[Takeover] Bot resumed for conv ${convId}`);
+    console.log(`[Takeover] Bot resumed for conv:${convId} (${isWebConv ? 'web' : 'whatsapp'})`);
     return;
   }
+
+  // ── For website conversations: agent messages stay in Chatwoot only (no WhatsApp) ──
+  if (isWebConv) {
+    const ts = await getTakeover(convId);
+    if (!ts?.active) return;
+    ts.lastAgentMessage = Date.now();
+    await setTakeover(convId, ts);
+    // Message is already in Chatwoot widget — nothing else to do
+    return;
+  }
+
+  // ── WhatsApp channel: forward agent message to customer via Twilio ──
+  const to = phone.startsWith('whatsapp:') ? phone : `whatsapp:${phone}`;
+  if (await isChatwootDuplicate(convId, text, msgId)) { console.log(`[CW Dedup] Skipped duplicate for conv:${convId}`); return; }
 
   const ts = await getTakeover(convId);
   if (!ts?.active) return;
   if (msgId && await isBotMessage(msgId)) { console.log(`[Echo] Blocked bot echo for ${msgId}`); return; }
   ts.lastAgentMessage = Date.now();
   await setTakeover(convId, ts);
+
   if (text) { await sendWhatsApp(to, text); return; }
   if (attachments?.length > 0) {
     for (const att of attachments) {
@@ -455,9 +706,9 @@ app.post('/chatwoot-webhook', async (req, res) => {
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.33 — online'));
+app.get('/', (req, res) => res.send('ATW WhatsApp Bot v10.34 — online'));
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 await redis.connect();
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.33 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`[Boot] ATW Bot v10.34 running on port ${PORT}`));
