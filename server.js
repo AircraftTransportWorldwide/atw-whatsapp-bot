@@ -516,6 +516,9 @@ app.post('/chatwoot-website-webhook', async (req, res) => {
     return;
   }
 
+  // ── Small delay on first message so widget WebSocket is ready ──
+  if (isFirstMessage) await new Promise(r => setTimeout(r, 1500));
+
   // ── Inquiry history for returning contacts ──
   let inquiryHistory = [];
   if (mem.visitorEmail && !mem.twentyContactId) {
