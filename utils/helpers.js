@@ -1,4 +1,4 @@
-=// utils/helpers.js — Shared utilities: retry, sanitize, ref number, best name
+// utils/helpers.js — Shared utilities: retry, sanitize, ref number, best name
 
 export async function withRetry(fn, retries = 3, delayMs = 500) {
   for (let i = 0; i < retries; i++) {
