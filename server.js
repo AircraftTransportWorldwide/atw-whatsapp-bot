@@ -349,7 +349,7 @@ app.post('/webhook', async (req, res) => {
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
 
   if (effectiveTier <= 2 && !mem.refNumber) {
-    mem.refNumber = generateRefNumber();
+    mem.refNumber = generateRefNumber('whatsapp');
     console.log(`[Ref] Generated ${mem.refNumber}`);
   }
 
@@ -575,7 +575,7 @@ app.post('/chatwoot-website-webhook', async (req, res) => {
   const effectiveTier = Math.min(tier, mem.highestTier || 3);
 
   if (effectiveTier <= 2 && !mem.refNumber) {
-    mem.refNumber = generateRefNumber();
+    mem.refNumber = generateRefNumber('web');
     console.log(`[Ref] Web generated ${mem.refNumber} for conv:${convId}`);
   }
 
